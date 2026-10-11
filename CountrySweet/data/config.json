@@ -1,0 +1,41 @@
+{
+  "synthetic_demo": true,
+  "total_available_acres": 60,
+  "yield_multipliers": {
+    "normal": 1,
+    "favorable": 1.1,
+    "adverse": 0.75
+  },
+  "high_demand_multiplier": 1.25,
+  "require_full_coverage": false,
+  "missing_cost_per_acre": 0,
+  "validation_horizon_weeks": 12,
+  "validation_folds": 3,
+  "min_training_weeks": 52,
+  "moving_average_weights": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "trees": 100,
+  "min_samples_leaf": 2,
+  "seed": 42,
+  "optional_defaults": {
+    "customer": "ALL",
+    "holiday_period": "unknown",
+    "planned_promotion": 0,
+    "promotion_type": "none",
+    "promotion_intensity": 0,
+    "game_day": 0,
+    "heart_healthy": 0
+  },
+  "assumptions": [
+    "ALL DATA AND PARAMETERS ARE SYNTHETIC CLASSROOM EXAMPLES, NOT COMPANY FACTS.",
+    "Yield, acreage, cost, penalties, safety stock, weather and multipliers require user verification.",
+    "Missing optional promotion flags default to zero; confirm that missing really means no planned promotion.",
+    "Sales/order pounds are used as demand; stockouts and unfilled orders may censor true demand.",
+    "High-demand multiplier is a user-selected stress case, not a statistical prediction interval.",
+    "Penalty and production costs must use the same currency. Acreage is continuous."
+  ]
+}

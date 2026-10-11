@@ -1,0 +1,4 @@
+crop_group,organic_status,expected_lbs_per_acre,packout_rate,cost_per_acre,min_acres,max_acres,safety_stock_pct,shortage_penalty_per_lb,excess_penalty_per_lb
+DEMO-orange,conventional,15000,0.8,600,1,40,0.1,4,0.02
+DEMO-orange,organic,12000,0.75,800,1,20,0.1,5,0.02
+DEMO-purple,conventional,13000,0.8,650,1,20,0.1,4,0.02
