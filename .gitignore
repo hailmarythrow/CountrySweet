@@ -1,0 +1,19 @@
+# Local Python environments
+.venv/
+.venv312/
+
+# Generated Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local test and tool output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Streamlit state and secrets
+.streamlit/secrets.toml
+
+# Temporary workbook exports
+~$*.xlsx
