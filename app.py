@@ -32,7 +32,12 @@ LOGO_PATH = Path(__file__).parent / "assets" / "country_sweet_logo.png"
 LOGO_DATA_URI = "data:image/png;base64," + base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
 LOGGER = logging.getLogger("country_sweet.dashboard")
 
-st.set_page_config(page_title="Country Sweet | Inventory Dashboard", page_icon=str(LOGO_PATH), layout="wide")
+st.set_page_config(
+    page_title="Country Sweet | Inventory Dashboard",
+    page_icon=str(LOGO_PATH),
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 REQUIRED = ["product", "variety", "classification", "size", "stored_lbs", "forecast_demand_lbs"]
 DEMO_ROWS = [
@@ -328,29 +333,86 @@ def get_weather(latitude: float, longitude: float) -> dict:
         raise
 
 
+def apply_weather_location(location: dict) -> None:
+    st.session_state.weather_location = location
+    st.session_state.weather_location_search = ""
+    st.session_state.weather_location_popover = False
+    st.rerun()
+
+
+@st.fragment(run_every="1s")
+def render_top_header() -> None:
+    """Render the dark-only brand, greeting, clock, and compact weather card."""
+    greeting, date, clock = get_welcome(st.session_state.timezone)
+    if "weather_location" not in st.session_state:
+        st.session_state.weather_location = DEFAULT_LOCATION.copy()
+    selected_location = st.session_state.weather_location
+
+    header_col, weather_col = st.columns([3, 1], gap="large", vertical_alignment="top")
+    with header_col:
+        st.markdown(
+            f"<div class='cs-brand-header'><img src='{LOGO_DATA_URI}' alt='Country Sweet Produce logo'>"
+            "<span class='cs-dashboard-title'>Inventory Dashboard</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.subheader(greeting)
+        st.caption(f"{date} • {clock}")
+        st.write("A clear view of stored inventory, demand coverage, and product mix.")
+    with weather_col:
+        st.markdown("**Current weather**")
+        location_col, edit_col = st.columns([5, 1], gap="small", vertical_alignment="center")
+        with location_col:
+            st.caption(location_label(selected_location))
+        with edit_col:
+            location_popover = st.popover(
+                " ",
+                type="tertiary",
+                icon=":material/edit_location:",
+                help="Change weather location",
+                key="weather_location_popover",
+            )
+            with location_popover:
+                st.caption("Search for a U.S. city or state")
+                search_query = st.text_input(
+                    "Search U.S. city",
+                    placeholder="City or state",
+                    label_visibility="collapsed",
+                    key="weather_location_search",
+                )
+                if search_query.strip():
+                    search_results, search_error = search_us_locations(search_query)
+                    if search_error:
+                        st.caption(search_error)
+                    elif search_results:
+                        labels = [location_label(location) for location in search_results]
+                        selected_label = st.selectbox("Matching U.S. cities", labels, key="weather_location_result")
+                        location_to_apply = search_results[labels.index(selected_label)]
+                        st.button(
+                            "Use this location",
+                            key="weather_location_apply",
+                            on_click=apply_weather_location,
+                            args=(location_to_apply,),
+                        )
+                    else:
+                        st.caption(f"No U.S. cities found for “{search_query.strip()}”.")
+        try:
+            weather = get_weather(selected_location["latitude"], selected_location["longitude"])
+            st.metric(location_label(selected_location), f"{weather['temperature']:.0f} °F")
+            st.caption(f"{weather['icon']} {weather['condition']}")
+        except Exception as exc:
+            LOGGER.warning("weather.widget_unavailable location=%s error=%s", location_label(selected_location), exc)
+            st.caption("Weather temporarily unavailable.")
+
+
 if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = False
+    st.session_state.dark_mode = True
+else:
+    st.session_state.dark_mode = True
 if "timezone" not in st.session_state:
     st.session_state.timezone = "America/Los_Angeles"
-if "workbook_replace_mode" not in st.session_state:
-    st.session_state.workbook_replace_mode = False
 
-
-def begin_workbook_replace() -> None:
-    st.session_state.workbook_replace_mode = True
-    st.session_state.pop("workbook_uploader", None)
-
-
-def cancel_workbook_replace() -> None:
-    st.session_state.workbook_replace_mode = False
-    st.session_state.pop("workbook_uploader", None)
-
-top_left, top_right = st.columns([5, 1])
-with top_left:
-    st.markdown(f"<div class='cs-brand-header'><img src='{LOGO_DATA_URI}' alt='Country Sweet Produce logo'><span class='cs-dashboard-title'>Inventory Dashboard</span></div>", unsafe_allow_html=True)
-with top_right:
-    st.session_state.dark_mode = st.toggle("Dark mode", value=st.session_state.dark_mode)
-apply_theme(st.session_state.dark_mode)
+apply_theme(True)
+render_top_header()
 
 previous_report = st.session_state.get("active_workbook_report")
 previous_name = st.session_state.get("active_workbook_name")
@@ -358,39 +420,46 @@ previous_content = st.session_state.get("active_workbook_content")
 workbook_report = None
 load_error = None
 uploaded = None
-refresh_requested = False
 
-
-with st.sidebar:
-    st.header("Dashboard settings")
-    tz_options = ["America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York", "UTC"]
-    st.session_state.timezone = st.selectbox("Welcome time zone", tz_options, index=tz_options.index(st.session_state.timezone))
-    st.divider()
-    st.header("Workbook")
-    st.caption("Choose a workbook to load its verified inventory data.")
+workbook_col, context_col = st.columns([2, 3], gap="large", vertical_alignment="top")
+with workbook_col:
+    st.markdown("#### Workbook")
     uploaded = st.file_uploader(
-        "Choose Workbook",
+        "Upload Workbook",
         type=["xlsx"],
         key="workbook_uploader",
         help="Forecasted Inventory Levels is the first worksheet used for inventory views.",
     )
     if previous_report is not None:
-        st.caption("Current Workbook")
-        st.write(st.session_state.get("active_workbook_name") or previous_name or "Workbook")
-        refresh_requested = st.button("Refresh Workbook", key="refresh_uploaded_workbook", width="stretch")
-        if previous_content:
-            st.caption("Refresh reprocesses the uploaded snapshot. It does not detect later edits in the original Excel file.")
-        else:
-            st.caption("The uploaded snapshot will be available for Refresh after it finishes validating.")
-        st.button("Replace Workbook", key="replace_workbook", on_click=begin_workbook_replace, width="stretch")
-        st.caption(f"Last Updated: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
-    if st.session_state.workbook_replace_mode and uploaded is None:
-        st.caption("Choose the newer workbook version to replace the current snapshot.")
-        st.button("Cancel replacement", key="cancel_workbook_replace", on_click=cancel_workbook_replace, width="stretch")
-    elif not st.session_state.workbook_replace_mode:
-        st.caption("New Excel edits require Replace Workbook unless a OneDrive or SharePoint connection is configured.")
-    st.caption("Automatic OneDrive/SharePoint retrieval is not configured for this dashboard.")
-    st.download_button("Download sample Excel template", data=excel_template(), file_name="inventory_template.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+        st.caption(f"Current workbook: **{st.session_state.get('active_workbook_name') or previous_name or 'Workbook'}**")
+        st.caption(f"Last updated: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
+        st.caption("Choose another .xlsx file above to replace this uploaded snapshot.")
+    else:
+        st.caption("No workbook uploaded. Demonstration data is active.")
+with context_col:
+    st.markdown("#### Data source")
+    if previous_report is not None:
+        st.caption("Uploaded snapshot · verified data")
+        st.caption("Automatic OneDrive/SharePoint retrieval is not configured, so Refresh is unavailable for this upload.")
+    else:
+        st.caption("Upload the Packout Analysis workbook to populate verified worksheet views.")
+    download_col, settings_col = st.columns([1, 1], gap="small")
+    with download_col:
+        st.download_button(
+            "Download sample template",
+            data=excel_template(),
+            file_name="inventory_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+    with settings_col:
+        with st.expander("Dashboard settings"):
+            tz_options = ["America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York", "UTC"]
+            st.session_state.timezone = st.selectbox(
+                "Welcome time zone",
+                tz_options,
+                index=tz_options.index(st.session_state.timezone),
+            )
 
 def parse_and_activate(
     content: bytes,
@@ -413,28 +482,7 @@ def parse_and_activate(
     return report
 
 
-if refresh_requested and previous_content:
-    refresh_started = perf_counter()
-    with st.sidebar.status("Refreshing uploaded snapshot", expanded=False) as refresh_status:
-        try:
-            refresh_status.update(label="Reading uploaded snapshot")
-            refresh_status.update(label="Validating data")
-            workbook_report = parse_and_activate(
-                previous_content,
-                name=st.session_state.get("active_workbook_name") or previous_name or "Workbook",
-                source_type="upload",
-                force_refresh=True,
-            )
-            refresh_status.update(label="Updating visualizations")
-            st.session_state.workbook_refresh_notice = f"Workbook refreshed successfully in {(perf_counter() - refresh_started) * 1000:.0f} ms."
-            refresh_status.update(label="Complete", state="complete")
-        except Exception as exc:
-            LOGGER.exception("excel.snapshot_refresh_failed filename=%s", previous_name)
-            load_error = str(exc)
-            st.session_state.active_workbook_error = load_error
-            st.session_state.active_workbook_stale = True
-            refresh_status.update(label="Refresh failed; previous data retained", state="error")
-elif uploaded is not None:
+if uploaded is not None:
     uploaded_bytes = uploaded.getvalue()
     upload_id = workbook_content_id(uploaded_bytes)
     active_id = st.session_state.get("active_workbook_id")
@@ -444,7 +492,7 @@ elif uploaded is not None:
         # A replacement can be byte-for-byte identical while arriving under
         # a new filename. Reuse the verified parse, but still update the
         # snapshot metadata so the UI reflects the workbook the user chose.
-        if st.session_state.workbook_replace_mode and uploaded.name != st.session_state.get("active_workbook_name"):
+        if uploaded.name != st.session_state.get("active_workbook_name"):
             _activate_workbook(
                 previous_report,
                 source_type="upload",
@@ -452,17 +500,15 @@ elif uploaded is not None:
                 content_id=upload_id,
                 content=uploaded_bytes,
             )
-            st.session_state.workbook_replace_mode = False
     else:
         upload_started = perf_counter()
-        with st.sidebar.status("File received", expanded=False) as upload_status:
+        with st.status("File received", expanded=False) as upload_status:
             upload_status.update(label="Reading workbook")
             try:
                 upload_status.update(label="Validating data")
                 workbook_report = parse_and_activate(uploaded_bytes, name=uploaded.name, source_type="upload")
                 upload_status.update(label="Updating visualizations")
                 LOGGER.info("excel.upload filename=%s bytes=%d elapsed_ms=%.1f content_id=%s", uploaded.name, len(uploaded_bytes), (perf_counter() - upload_started) * 1000, upload_id[:12])
-                st.session_state.workbook_replace_mode = False
                 upload_status.update(label="Complete", state="complete")
             except Exception as exc:
                 LOGGER.exception("excel.upload_failed filename=%s", uploaded.name)
@@ -488,16 +534,15 @@ else:
         sheet for sheet, item in workbook_report.sheet_reports.items()
         if item.semantic == "inventory" and sheet in workbook_report.frames
     ]
-    with st.sidebar:
-        sheet_options = inventory_sheets or list(workbook_report.frames)
-        if sheet_options:
-            selected_sheet = st.selectbox(
-                "Primary inventory worksheet",
-                sheet_options,
-                index=sheet_options.index(workbook_report.preferred_sheet) if workbook_report.preferred_sheet in sheet_options else 0,
-            )
-        else:
-            selected_sheet = ""
+    sheet_options = inventory_sheets or list(workbook_report.frames)
+    if sheet_options:
+        selected_sheet = st.selectbox(
+            "Primary inventory worksheet",
+            sheet_options,
+            index=sheet_options.index(workbook_report.preferred_sheet) if workbook_report.preferred_sheet in sheet_options else 0,
+        )
+    else:
+        selected_sheet = ""
     if selected_sheet and selected_sheet in workbook_report.frames:
         df = normalize_frame(workbook_report.frames[selected_sheet])
         source_sheet, source_status = selected_sheet, "Verified workbook data"
@@ -517,71 +562,40 @@ if load_error:
     else:
         st.warning(f"The workbook could not be loaded: {load_error} Demo data remains active.")
 
-with st.sidebar:
-    st.divider()
-    if uploaded is not None and previous_report is None and workbook_report is not None:
-        st.caption("Current Workbook")
-        st.write(st.session_state.get("active_workbook_name") or uploaded.name)
-        st.button("Refresh Workbook", key="refresh_uploaded_workbook", width="stretch")
-        st.button("Replace Workbook", key="replace_workbook", on_click=begin_workbook_replace, width="stretch")
-    st.caption("Connection status")
-    if workbook_report is None:
-        st.caption("Demo mode · no workbook connected")
-    else:
-        st.caption("Loaded · workbook snapshot")
-        st.caption(f"File: {st.session_state.get('active_workbook_name', source_name)}")
-        st.caption(f"Last Updated: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
-        if st.session_state.get("active_workbook_stale"):
-            st.caption("Showing data from the last successful update.")
-    notice = st.session_state.pop("workbook_refresh_notice", "")
-    if notice:
-        st.success(notice)
-
 timeline_filter_frame = None
 if workbook_report is not None:
     _, timeline_filter_frame = frame_for(workbook_report, "inventory_timeline")
 week_option_frame = timeline_filter_frame if timeline_filter_frame is not None else df
 
-with st.sidebar:
-    st.header("Filters")
-    st.caption("Leave a filter blank to include all available values.")
-    year_frames = [
-        frame[["year"]]
-        for frame in (df, week_option_frame)
-        if frame is not None and "year" in frame
-    ]
-    year_source = pd.concat(year_frames, ignore_index=True) if year_frames else pd.DataFrame(columns=["year"])
-    year_options = options(year_source, "year")
-    week_options = options(week_option_frame, "week")
-    filter_signature = f"{getattr(workbook_report, 'content_id', 'demo')}::{source_sheet or 'demo'}"
-    filter_keys = {
-        "year": "filter_year", "week": "filter_week", "variety": "filter_variety",
-        "size": "filter_size", "classification": "filter_classification",
-        "product": "filter_product", "packaging_type": "filter_packaging_type",
-    }
-    if st.session_state.get("filter_signature") != filter_signature:
-        for key in filter_keys.values():
-            st.session_state[key] = []
-        st.session_state.filter_signature = filter_signature
-
-    year_filter = st.multiselect("Year", year_options, key=filter_keys["year"], placeholder="All years")
-    week_filter = st.multiselect("Reporting week", week_options, key=filter_keys["week"], placeholder="All weeks")
-    variety_filter = st.multiselect("Variety", options(df, "variety"), key=filter_keys["variety"], placeholder="All varieties")
-    size_filter = st.multiselect("Size", options(df, "size"), key=filter_keys["size"], placeholder="All sizes")
-    class_filter = st.multiselect("Organic / conventional", options(df, "classification"), key=filter_keys["classification"], placeholder="All classifications")
-    product_filter = st.multiselect("Product", options(df, "product"), key=filter_keys["product"], placeholder="All products")
-    packaging_filter = st.multiselect("Packaging type", options(df, "packaging_type"), key=filter_keys["packaging_type"], placeholder="All packaging")
-
-    def reset_filters() -> None:
-        for key in filter_keys.values():
-            st.session_state[key] = []
-
-    st.button("Reset filters", width="stretch", on_click=reset_filters)
+year_frames = [
+    frame[["year"]]
+    for frame in (df, week_option_frame)
+    if frame is not None and "year" in frame
+]
+year_source = pd.concat(year_frames, ignore_index=True) if year_frames else pd.DataFrame(columns=["year"])
+year_options = options(year_source, "year")
+week_options = options(week_option_frame, "week")
+filter_signature = f"{getattr(workbook_report, 'content_id', 'demo')}::{source_sheet or 'demo'}"
+filter_keys = {
+    "year": "filter_year", "week": "filter_week", "variety": "filter_variety",
+    "size": "filter_size", "classification": "filter_classification",
+    "product": "filter_product", "packaging_type": "filter_packaging_type",
+}
+if st.session_state.get("filter_signature") != filter_signature:
+    for key in filter_keys.values():
+        st.session_state[key] = []
+    st.session_state.filter_signature = filter_signature
+for key in filter_keys.values():
+    st.session_state.setdefault(key, [])
 
 filters = {
-    "year": year_filter, "week": week_filter, "variety": variety_filter,
-    "size": size_filter, "classification": class_filter, "product": product_filter,
-    "packaging_type": packaging_filter,
+    "year": st.session_state[filter_keys["year"]],
+    "week": st.session_state[filter_keys["week"]],
+    "variety": st.session_state[filter_keys["variety"]],
+    "size": st.session_state[filter_keys["size"]],
+    "classification": st.session_state[filter_keys["classification"]],
+    "product": st.session_state[filter_keys["product"]],
+    "packaging_type": st.session_state[filter_keys["packaging_type"]],
 }
 filtered = apply_filters(df, filters)
 record_stage_counts = {
@@ -598,77 +612,6 @@ record_stage_counts = {
 if not df.empty and filtered.empty:
     st.warning("No records match the selected filters. Blank filters mean All; use Reset filters to restore the complete verified dataset.", icon="⚠️")
 
-
-def apply_weather_location(location: dict) -> None:
-    st.session_state.weather_location = location
-    st.session_state.weather_location_search = ""
-    st.session_state.weather_location_popover = False
-    st.rerun()
-
-
-@st.fragment(run_every="1s")
-def render_header() -> None:
-    greeting, date, clock = get_welcome(st.session_state.timezone)
-    if "weather_location" not in st.session_state:
-        st.session_state.weather_location = DEFAULT_LOCATION.copy()
-    selected_location = st.session_state.weather_location
-    hcol, wcol = st.columns([3, 1])
-    with hcol:
-        st.subheader(greeting)
-        st.caption(f"{date} • {clock}")
-        st.write("A clear view of stored inventory, demand coverage, and product mix.")
-    with wcol:
-        st.markdown("**Current weather**")
-        location_col, edit_col = st.columns([5, 1], gap="small", vertical_alignment="center")
-        with location_col:
-            st.caption(location_label(selected_location))
-        with edit_col:
-            location_popover = st.popover(
-                " ",
-                type="tertiary",
-                icon=":material/edit_location:",
-                help="Change weather location",
-                key="weather_location_popover",
-                on_change="rerun",
-            )
-            with location_popover:
-                if location_popover.open:
-                    st.caption("Search for a U.S. city or state")
-                    search_query = st.text_input(
-                        "Search U.S. city",
-                        placeholder="City or state",
-                        label_visibility="collapsed",
-                        key="weather_location_search",
-                    )
-                    if search_query.strip():
-                        search_results, search_error = search_us_locations(search_query)
-                        if search_error:
-                            st.caption(search_error)
-                        elif search_results:
-                            labels = [location_label(location) for location in search_results]
-                            selected_label = st.selectbox("Matching U.S. cities", labels, key="weather_location_result")
-                            location_to_apply = search_results[labels.index(selected_label)]
-                            st.button(
-                                "Use this location",
-                                key="weather_location_apply",
-                                on_click=apply_weather_location,
-                                args=(location_to_apply,),
-                            )
-                        else:
-                            st.caption(f"No U.S. cities found for “{search_query.strip()}”.")
-        try:
-            weather = get_weather(selected_location["latitude"], selected_location["longitude"])
-            st.metric(location_label(selected_location), f"{weather['temperature']:.0f} °F")
-            st.caption(f"{weather['icon']} {weather['condition']}")
-        except Exception as exc:
-            LOGGER.warning(
-                "weather.widget_unavailable location=%s error=%s",
-                location_label(selected_location), exc,
-            )
-            st.caption("Weather temporarily unavailable.")
-
-
-render_header()
 period = source_period(df) if not df.empty else "Reporting period not supplied"
 st.caption(f"Source: **{source_name}** · Worksheet: **{source_sheet or 'Unavailable'}** · Reporting period: **{period}** · {source_status}")
 
@@ -713,6 +656,31 @@ if workbook_report is not None and source_sheet == workbook_report.semantic_shee
     cm_col, upcoming_col = st.columns(2)
     cm_col.metric("Contribution margin", f"${contribution:,.0f}" if pd.notna(contribution) else "Not available from selected worksheet")
     upcoming_col.metric("Upcoming planned pounds", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
+
+st.markdown("#### Filters")
+st.caption("Leave a filter blank to include all available values.")
+filter_row_one = st.columns(4, gap="small")
+with filter_row_one[0]:
+    st.multiselect("Year", year_options, key=filter_keys["year"], placeholder="All years")
+with filter_row_one[1]:
+    st.multiselect("Reporting week", week_options, key=filter_keys["week"], placeholder="All weeks")
+with filter_row_one[2]:
+    st.multiselect("Variety", options(df, "variety"), key=filter_keys["variety"], placeholder="All varieties")
+with filter_row_one[3]:
+    st.multiselect("Organic / conventional", options(df, "classification"), key=filter_keys["classification"], placeholder="All classifications")
+filter_row_two = st.columns(4, gap="small")
+with filter_row_two[0]:
+    st.multiselect("Size", options(df, "size"), key=filter_keys["size"], placeholder="All sizes")
+with filter_row_two[1]:
+    st.multiselect("Product", options(df, "product"), key=filter_keys["product"], placeholder="All products")
+with filter_row_two[2]:
+    st.multiselect("Packaging type", options(df, "packaging_type"), key=filter_keys["packaging_type"], placeholder="All packaging")
+with filter_row_two[3]:
+    def reset_filters() -> None:
+        for key in filter_keys.values():
+            st.session_state[key] = []
+
+    st.button("Reset filters", width="stretch", on_click=reset_filters)
 
 overview, timeline, organic, breakdown, harvest_sales, purchasing, explorer = st.tabs([
     "Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown",
