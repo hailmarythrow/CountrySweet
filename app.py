@@ -1,7 +1,6 @@
 """Country Sweet Produce inventory visualization dashboard."""
 from __future__ import annotations
 
-import base64
 from datetime import datetime
 from io import BytesIO
 import logging
@@ -20,17 +19,22 @@ from utils.charts import (
     inventory_comparison,
     inventory_timeline,
     load_comparison,
+    loads_timeline,
     measure_timeline,
     packout_chart,
 )
 from utils.excel_loader import REPORT_SCHEMA_VERSION, frame_for, load_inventory_workbook, normalize_frame, report_to_frame, timings_to_frame, workbook_content_id
 from utils.theme import apply_theme
-from utils.ui import render_chart, render_quality_alerts, source_caption
+from utils.ui import render_chart, render_quality_summary, source_caption
 from utils.validation import apply_filters, filter_caption, options, source_period
 
-LOGO_PATH = Path(__file__).parent / "assets" / "country_sweet_logo.png"
-LOGO_DATA_URI = "data:image/png;base64," + base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "Country_Sweet_Produce_Logo_HD.png"
 LOGGER = logging.getLogger("country_sweet.dashboard")
+LOGGER.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 st.set_page_config(
     page_title="Country Sweet | Inventory Dashboard",
@@ -54,6 +58,9 @@ DEFAULT_LOCATION = {
     "latitude": 35.3733,
     "longitude": -119.0187,
 }
+# Manual refresh remains implemented for a future persistent OneDrive,
+# SharePoint, or local connection, but is temporarily disabled in the UI.
+ENABLE_WORKBOOK_REFRESH = False
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -152,14 +159,6 @@ def _timestamp_label(value: object) -> str:
         return datetime.fromisoformat(str(value)).astimezone().strftime("%b %d, %Y %I:%M:%S %p %Z")
     except (TypeError, ValueError):
         return str(value)
-
-
-def _short_path(path_text: str) -> str:
-    path = Path(path_text).expanduser()
-    try:
-        return str(path.relative_to(Path.home())) if path.is_relative_to(Path.home()) else str(path)
-    except (ValueError, OSError):
-        return str(path)
 
 
 def _activate_workbook(
@@ -350,11 +349,11 @@ def render_top_header() -> None:
 
     header_col, weather_col = st.columns([3, 1], gap="large", vertical_alignment="top")
     with header_col:
-        st.markdown(
-            f"<div class='cs-brand-header'><img src='{LOGO_DATA_URI}' alt='Country Sweet Produce logo'>"
-            "<span class='cs-dashboard-title'>Inventory Dashboard</span></div>",
-            unsafe_allow_html=True,
-        )
+        brand_logo_col, brand_title_col = st.columns([1, 4], gap="small", vertical_alignment="center")
+        with brand_logo_col:
+            st.image(str(LOGO_PATH), width=130, output_format="PNG")
+        with brand_title_col:
+            st.markdown("<div class='cs-dashboard-title'>Inventory Dashboard</div>", unsafe_allow_html=True)
         st.subheader(greeting)
         st.caption(f"{date} • {clock}")
         st.write("A clear view of stored inventory, demand coverage, and product mix.")
@@ -420,46 +419,42 @@ previous_content = st.session_state.get("active_workbook_content")
 workbook_report = None
 load_error = None
 uploaded = None
+refresh_clicked = False
 
-workbook_col, context_col = st.columns([2, 3], gap="large", vertical_alignment="top")
+workbook_col = st.container()
 with workbook_col:
-    st.markdown("#### Workbook")
+    st.markdown("#### Current workbook")
     uploaded = st.file_uploader(
-        "Upload Workbook",
+        "Upload workbook snapshot",
         type=["xlsx"],
         key="workbook_uploader",
-        help="Forecasted Inventory Levels is the first worksheet used for inventory views.",
+        help="A browser upload is a validated snapshot. Replace it here when you have a newer workbook version.",
     )
-    if previous_report is not None:
-        st.caption(f"Current workbook: **{st.session_state.get('active_workbook_name') or previous_name or 'Workbook'}**")
-        st.caption(f"Last updated: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
-        st.caption("Choose another .xlsx file above to replace this uploaded snapshot.")
-    else:
-        st.caption("No workbook uploaded. Demonstration data is active.")
-with context_col:
-    st.markdown("#### Data source")
-    if previous_report is not None:
-        st.caption("Uploaded snapshot · verified data")
-        st.caption("Automatic OneDrive/SharePoint retrieval is not configured, so Refresh is unavailable for this upload.")
-    else:
-        st.caption("Upload the Packout Analysis workbook to populate verified worksheet views.")
-    download_col, settings_col = st.columns([1, 1], gap="small")
-    with download_col:
-        st.download_button(
-            "Download sample template",
-            data=excel_template(),
-            file_name="inventory_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-        )
-    with settings_col:
-        with st.expander("Dashboard settings"):
-            tz_options = ["America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York", "UTC"]
-            st.session_state.timezone = st.selectbox(
-                "Welcome time zone",
-                tz_options,
-                index=tz_options.index(st.session_state.timezone),
+    info_col = st.container()
+    with info_col:
+        if previous_report is not None:
+            st.caption(f"Current workbook: **{st.session_state.get('active_workbook_name') or previous_name or 'Workbook'}**")
+            st.caption(f"Last successful refresh: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
+            if st.session_state.get("active_workbook_last_saved"):
+                st.caption(f"Last saved: {_timestamp_label(st.session_state.get('active_workbook_last_saved'))}")
+        elif uploaded is not None:
+            st.caption("Workbook received. Validating the uploaded data…")
+        else:
+            st.caption("No workbook selected. Upload a workbook snapshot to begin.")
+    if ENABLE_WORKBOOK_REFRESH:
+        with st.container():
+            refresh_clicked = st.button(
+                "Refresh workbook",
+                key="refresh_workbook",
+                width="stretch",
+                disabled=not bool(st.session_state.get("active_workbook_path")),
+                help="Available only when a persistent workbook connection is configured.",
             )
+    if previous_report is not None:
+        if st.session_state.get("active_workbook_source_type") == "local_link":
+            st.caption("Connected to the local workbook. Refresh reads its latest saved file contents.")
+        else:
+            st.caption("Uploaded snapshot. Refresh is unavailable because the original Desktop file location is not exposed by a browser upload.")
 
 def parse_and_activate(
     content: bytes,
@@ -472,18 +467,63 @@ def parse_and_activate(
 ):
     content_id = workbook_content_id(content)
     if force_refresh:
-        # Explicit refresh means "reprocess the retained upload snapshot";
+        # Explicit refresh means "reprocess the latest saved source";
         # normal reruns still use the content hash to avoid unnecessary work.
         cached_workbook_report.clear()
+    parse_started = perf_counter()
     report = cached_workbook_report(content, content_id, REPORT_SCHEMA_VERSION)
+    LOGGER.info(
+        "excel.parse_complete filename=%s content_id=%s elapsed_ms=%.1f parser_total_ms=%.1f",
+        name,
+        content_id[:12],
+        (perf_counter() - parse_started) * 1000,
+        report.timings.get("total_ms", 0.0),
+    )
     if not has_verified_inventory(report):
         raise ValueError("No verified inventory rows were found in Current Week Model or Forecasted Inventory Levels.")
     _activate_workbook(report, source_type=source_type, name=name, content_id=content_id, content=content, path=path, file_stat=file_stat)
     return report
 
 
-if uploaded is not None:
+if refresh_clicked and st.session_state.get("active_workbook_path"):
+    refresh_path = st.session_state.get("active_workbook_path")
+    try:
+        with st.status("Refreshing workbook", expanded=False) as refresh_status:
+            refresh_status.update(label="File received")
+            LOGGER.info("excel.stage File received path=%s", refresh_path)
+            refresh_status.update(label="Reading workbook")
+            LOGGER.info("excel.stage Reading workbook path=%s", refresh_path)
+            refresh_status.update(label="Validating data")
+            refresh_path_obj, refresh_content, refresh_stat = _read_linked_workbook(refresh_path)
+            refreshed_report = parse_and_activate(
+                refresh_content,
+                name=refresh_path_obj.name,
+                source_type="local_link",
+                path=refresh_path_obj,
+                file_stat=refresh_stat,
+                force_refresh=True,
+            )
+            refresh_status.update(label="Updating visualizations")
+            LOGGER.info("excel.stage Updating visualizations path=%s", refresh_path)
+            workbook_report = refreshed_report
+            refresh_status.update(label="Complete", state="complete")
+        st.success(f"Workbook refreshed at {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}.")
+    except Exception as exc:
+        LOGGER.exception("excel.refresh_failed path=%s", refresh_path)
+        load_error = str(exc)
+        st.session_state.active_workbook_error = load_error
+        st.session_state.active_workbook_stale = True
+        workbook_report = previous_report
+
+if uploaded is not None and not refresh_clicked:
+    upload_received_started = perf_counter()
     uploaded_bytes = uploaded.getvalue()
+    LOGGER.info(
+        "excel.file_received filename=%s bytes=%d copy_elapsed_ms=%.1f",
+        uploaded.name,
+        len(uploaded_bytes),
+        (perf_counter() - upload_received_started) * 1000,
+    )
     upload_id = workbook_content_id(uploaded_bytes)
     active_id = st.session_state.get("active_workbook_id")
     active_source = st.session_state.get("active_workbook_source_type")
@@ -503,13 +543,25 @@ if uploaded is not None:
     else:
         upload_started = perf_counter()
         with st.status("File received", expanded=False) as upload_status:
+            LOGGER.info("excel.stage File received filename=%s", uploaded.name)
             upload_status.update(label="Reading workbook")
+            LOGGER.info("excel.stage Reading workbook filename=%s", uploaded.name)
             try:
                 upload_status.update(label="Validating data")
+                LOGGER.info("excel.stage Validating data filename=%s", uploaded.name)
                 workbook_report = parse_and_activate(uploaded_bytes, name=uploaded.name, source_type="upload")
+                LOGGER.info(
+                    "excel.data_normalized filename=%s records=%d worksheets=%d validation_elapsed_ms=%.1f",
+                    uploaded.name,
+                    sum(len(frame) for frame in workbook_report.frames.values()),
+                    len(workbook_report.available_sheets),
+                    workbook_report.timings.get("validation_ms", 0.0),
+                )
                 upload_status.update(label="Updating visualizations")
+                LOGGER.info("excel.stage Updating visualizations filename=%s", uploaded.name)
                 LOGGER.info("excel.upload filename=%s bytes=%d elapsed_ms=%.1f content_id=%s", uploaded.name, len(uploaded_bytes), (perf_counter() - upload_started) * 1000, upload_id[:12])
                 upload_status.update(label="Complete", state="complete")
+                LOGGER.info("excel.stage Complete filename=%s total_elapsed_ms=%.1f", uploaded.name, (perf_counter() - upload_started) * 1000)
             except Exception as exc:
                 LOGGER.exception("excel.upload_failed filename=%s", uploaded.name)
                 load_error = str(exc)
@@ -522,7 +574,7 @@ if uploaded is not None:
                 upload_status.update(label="Workbook could not be processed; previous data retained", state="error")
     if workbook_report is None and previous_report is not None:
         workbook_report = previous_report
-elif previous_report is not None:
+elif workbook_report is None and previous_report is not None:
     workbook_report = previous_report
 
 if workbook_report is None:
@@ -556,6 +608,10 @@ if workbook_report is not None:
         source_status = "Uploaded snapshot · verified data"
         if st.session_state.get("active_workbook_stale"):
             source_status = "Uploaded snapshot · showing last successful update"
+    elif active_source == "local_link":
+        source_status = "Local workbook · verified data"
+        if st.session_state.get("active_workbook_stale"):
+            source_status = "Local workbook · showing last successful update"
 if load_error:
     if previous_report is not None:
         st.warning(f"The workbook could not be loaded: {load_error} The previous successfully loaded data remains active.")
@@ -616,7 +672,7 @@ period = source_period(df) if not df.empty else "Reporting period not supplied"
 st.caption(f"Source: **{source_name}** · Worksheet: **{source_sheet or 'Unavailable'}** · Reporting period: **{period}** · {source_status}")
 
 if workbook_report:
-    render_quality_alerts(workbook_report.warnings)
+    render_quality_summary(workbook_report)
     with st.expander("Workbook validation and worksheet details"):
         st.dataframe(
             pd.DataFrame([{"Stage": stage, "Records": count} for stage, count in record_stage_counts.items()]),
@@ -682,10 +738,16 @@ with filter_row_two[3]:
 
     st.button("Reset filters", width="stretch", on_click=reset_filters)
 
-overview, timeline, organic, breakdown, harvest_sales, purchasing, explorer = st.tabs([
-    "Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown",
-    "Harvest & Sales", "Purchasing & Loads", "Data Explorer & Quality",
-])
+visualization_started = perf_counter()
+harvest_view_available = bool(workbook_report and frame_for(workbook_report, "harvest_sales")[1] is not None and not frame_for(workbook_report, "harvest_sales")[1].empty)
+purchasing_view_available = bool(workbook_report and frame_for(workbook_report, "purchasing_loads")[1] is not None and not frame_for(workbook_report, "purchasing_loads")[1].empty)
+tab_names = ["Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown"]
+if harvest_view_available:
+    tab_names.append("Harvest & Sales")
+if purchasing_view_available:
+    tab_names.append("Purchasing & Loads")
+tab_names.append("Data Explorer & Quality")
+tab_map = dict(zip(tab_names, st.tabs(tab_names)))
 
 
 def source_frame_for(semantic: str, measures: list[str]) -> tuple[str | None, pd.DataFrame | None]:
@@ -699,7 +761,7 @@ def source_frame_for(semantic: str, measures: list[str]) -> tuple[str | None, pd
             return source_sheet, frame
     return None, None
 
-with overview:
+with tab_map["Executive Overview"]:
     st.subheader("Executive overview")
     source_caption(source_sheet, filtered, period)
     if filtered.empty:
@@ -708,7 +770,7 @@ with overview:
         render_chart(lambda: inventory_comparison(filtered), "executive_overview", "Stored inventory and forecast demand by product")
         st.download_button("Download filtered inventory summary (CSV)", data=filtered.to_csv(index=False).encode("utf-8"), file_name="inventory_summary.csv", mime="text/csv")
 
-with timeline:
+with tab_map["Inventory Timeline"]:
     st.subheader("Inventory timeline")
     timeline_sheet, timeline_frame = source_frame_for("inventory_timeline", ["stored_lbs"])
     timeline_filtered = apply_filters(timeline_frame, filters) if timeline_frame is not None else None
@@ -717,7 +779,7 @@ with timeline:
     if timeline_fig is None:
         st.info("A verified inventory timeline requires the Forecasted Inventory Levels worksheet with reporting dates or weeks.")
 
-with organic:
+with tab_map["Organic vs. Conventional"]:
     st.subheader("Organic versus conventional")
     source_caption(source_sheet, filtered, period)
     if filtered.empty or "classification" not in filtered or not filtered["classification"].notna().any():
@@ -725,7 +787,7 @@ with organic:
     else:
         render_chart(lambda: classification_comparison(filtered), "classification_comparison", "Stored inventory by organic and conventional classification")
 
-with breakdown:
+with tab_map["Product Breakdown"]:
     st.subheader("Product breakdown")
     source_caption(source_sheet, filtered, period)
     left, right = st.columns(2)
@@ -740,32 +802,75 @@ with breakdown:
         else:
             st.info("No verified size values are available.")
 
-with harvest_sales:
-    st.subheader("Harvest & sales")
-    harvest_sheet, harvest_frame = source_frame_for("harvest_sales", ["harvest_lbs", "sales_lbs", "packout_pct"])
-    harvest_filtered = apply_filters(harvest_frame, filters) if harvest_frame is not None else None
-    source_caption(harvest_sheet, harvest_filtered, source_period(harvest_filtered) if harvest_filtered is not None and not harvest_filtered.empty else "Reporting period not supplied")
-    if harvest_filtered is None or harvest_filtered.empty:
-        st.info("No verified harvest, sales, or packout worksheet is available for this workbook.")
-    else:
-        measure_fig = render_chart(lambda: measure_timeline(harvest_filtered, ["harvest_lbs", "sales_lbs"]), "harvest_sales_timeline", "Harvest and sales plan trends")
-        packout_fig = render_chart(lambda: packout_chart(harvest_filtered), "packout", "Packout values from the workbook")
-        if measure_fig is None and packout_fig is None:
-            st.info("The worksheet was recognized, but no usable harvest, sales, or packout values were supplied.")
+if harvest_view_available:
+    with tab_map["Harvest & Sales"]:
+        st.subheader("Harvest & sales")
+        harvest_sheet, harvest_frame = source_frame_for("harvest_sales", ["harvest_lbs", "planned_sales_lbs", "packout_pct"])
+        if harvest_frame is not None:
+            # These sources do not share a verified calendar: harvest has week
+            # numbers without a crop year, while Sales by Week has explicit
+            # 2026–2027 years. Filter each series independently and never
+            # connect unrelated periods on one continuous line.
+            harvest_series = harvest_frame[harvest_frame["harvest_lbs"].notna()].copy()
+            sales_series = harvest_frame[harvest_frame["planned_sales_lbs"].notna()].copy()
+            packout_series = harvest_frame[harvest_frame["packout_pct"].notna()].copy()
+            dimension_filters = {key: values for key, values in filters.items() if key not in {"year", "week"}}
+            harvest_filtered = apply_filters(harvest_series, dimension_filters)
+            sales_filtered = apply_filters(sales_series, filters)
+            packout_filtered = apply_filters(packout_series, dimension_filters)
+        else:
+            harvest_filtered = sales_filtered = packout_filtered = None
+        source_caption(harvest_sheet, harvest_frame, source_period(harvest_frame) if harvest_frame is not None and not harvest_frame.empty else "Reporting period not supplied")
+        st.caption("Harvest and sales are shown in separate charts because only Sales by Week includes a verified crop year. Values remain in the workbook's supplied pounds; no additional packout adjustment is applied.")
+        render_chart(lambda: measure_timeline(harvest_filtered, ["harvest_lbs"]) if harvest_filtered is not None else None, "harvest_timeline", "Forecast harvest pounds by source week")
+        render_chart(lambda: measure_timeline(sales_filtered, ["planned_sales_lbs"]) if sales_filtered is not None else None, "sales_timeline", "Planned sales pounds by crop year and week")
+        render_chart(lambda: packout_chart(packout_filtered) if packout_filtered is not None else None, "packout", "Monthly packout percentages from the workbook")
+        if packout_filtered is not None and not packout_filtered.empty and "source_cell" in packout_filtered:
+            with st.expander("Packout source points"):
+                st.dataframe(
+                    packout_filtered[["product", "period_label", "packout_pct", "source_cell", "source_period"]],
+                    width="stretch", hide_index=True,
+                )
 
-with purchasing:
-    st.subheader("Purchasing & loads")
-    purchasing_sheet, purchasing_frame = source_frame_for("purchasing_loads", ["purchased_loads", "remaining_loads"])
-    purchasing_filtered = apply_filters(purchasing_frame, filters) if purchasing_frame is not None else None
-    source_caption(purchasing_sheet, purchasing_filtered, source_period(purchasing_filtered) if purchasing_filtered is not None and not purchasing_filtered.empty else "Reporting period not supplied")
-    if purchasing_filtered is None or purchasing_filtered.empty:
-        st.info("No verified purchasing or loads worksheet is available for this workbook.")
-    else:
-        loads_fig = render_chart(lambda: load_comparison(purchasing_filtered), "purchasing_loads", "Purchased and remaining loads")
-        if loads_fig is None:
-            st.info("The worksheet was recognized, but purchased or remaining load values were not available.")
+if purchasing_view_available:
+    with tab_map["Purchasing & Loads"]:
+        st.subheader("Purchasing & loads")
+        purchasing_sheet, purchasing_frame = source_frame_for("purchasing_loads", ["total_loads_needed", "purchased_loads", "remaining_loads", "loads_per_week"])
+        purchasing_filtered = apply_filters(purchasing_frame, filters) if purchasing_frame is not None else None
+        source_caption(purchasing_sheet, purchasing_filtered, source_period(purchasing_filtered) if purchasing_filtered is not None and not purchasing_filtered.empty else "Reporting period not supplied")
+        if purchasing_filtered is not None and not purchasing_filtered.empty:
+            def source_sum(column: str) -> tuple[float | None, int, int]:
+                values = pd.to_numeric(purchasing_filtered[column], errors="coerce") if column in purchasing_filtered else pd.Series(dtype="float64")
+                valid = values.dropna()
+                total = valid.sum(min_count=1)
+                return (float(total) if pd.notna(total) else None, int(valid.size), int((valid < 0).sum()))
 
-with explorer:
+            total_needed, needed_rows, needed_negative = source_sum("total_loads_needed")
+            purchased, purchased_rows, purchased_negative = source_sum("purchased_loads")
+            remaining, remaining_rows, remaining_negative = source_sum("remaining_loads")
+            metric_columns = st.columns(3)
+            needed_label = "Total loads needed (review)" if needed_negative else "Total loads needed (source)"
+            remaining_label = "Loads remaining (review)" if remaining_negative else "Loads remaining (source)"
+            metric_columns[0].metric(needed_label, f"{total_needed:,.2f}" if total_needed is not None else "Unavailable")
+            metric_columns[1].metric("Loads purchased (source)", f"{purchased:,.2f}" if purchased is not None else "Unavailable")
+            metric_columns[2].metric(remaining_label, f"{remaining:,.2f}" if remaining is not None else "Unavailable")
+            if any(value > 0 for value in [needed_negative, purchased_negative, remaining_negative]):
+                st.caption("⚠️ Review required: the POs worksheet contains negative load values. They are displayed exactly as supplied and were not converted to zero or absolute values.")
+            st.caption(
+                f"Separate valid-cell totals: needed {needed_rows} rows, purchased {purchased_rows} rows, remaining {remaining_rows} rows. These populations do not fully reconcile because some purchased cells have invalid or missing needed/remaining values. POs formula errors remain listed in the quality report."
+            )
+            po_rows = purchasing_filtered[purchasing_filtered.get("source_cells", pd.Series(index=purchasing_filtered.index)).notna()].copy() if "source_cells" in purchasing_filtered else pd.DataFrame()
+            if not po_rows.empty:
+                with st.expander("PO source reconciliation"):
+                    st.dataframe(
+                        po_rows[["product", "total_loads_needed", "purchased_loads", "remaining_loads", "source_cells", "source_period"]],
+                        width="stretch", hide_index=True,
+                    )
+            render_chart(lambda: load_comparison(purchasing_filtered), "purchasing_loads", "Purchased and remaining loads from POs")
+            st.caption("Loads per Week is plotted as an overall weekly trend. Product and variety filters above still apply; blank cells are omitted and source zeros remain zeros. The source does not provide a crop year.")
+            render_chart(lambda: loads_timeline(purchasing_filtered), "weekly_loads", "Overall weekly loads from Loads per Week")
+
+with tab_map["Data Explorer & Quality"]:
     st.subheader("Data explorer & quality")
     if workbook_report:
         st.dataframe(report_to_frame(workbook_report), width="stretch", hide_index=True)
@@ -776,6 +881,13 @@ with explorer:
     else:
         st.dataframe(explorer_df, width="stretch", hide_index=True, alt="Searchable verified source records")
         st.download_button("Download verified records (CSV)", data=explorer_df.to_csv(index=False).encode("utf-8"), file_name="verified_records.csv", mime="text/csv")
+
+LOGGER.info(
+    "dashboard.visualizations_updated workbook=%s elapsed_ms=%.1f charts=%d",
+    source_name,
+    (perf_counter() - visualization_started) * 1000,
+    len(st.session_state.get("chart_timings", {})),
+)
 
 if st.session_state.get("chart_timings"):
     with st.expander("Dashboard render timings"):

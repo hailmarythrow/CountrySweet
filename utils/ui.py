@@ -7,6 +7,7 @@ from time import perf_counter
 import pandas as pd
 import streamlit as st
 
+from utils.excel_loader import WorkbookReport, report_to_frame
 from utils.theme import style_figure
 
 
@@ -21,8 +22,28 @@ def source_caption(sheet: str | None, frame: pd.DataFrame | None, period: str) -
 
 
 def render_quality_alerts(warnings: list[str]) -> None:
-    for warning in warnings:
-        st.warning(warning, icon="⚠️")
+    """Backward-compatible compact warning summary."""
+    if warnings:
+        st.warning(f"Data quality review: {len(warnings)} issue(s) detected. Expand the details panel below.", icon="⚠️")
+
+
+def render_quality_summary(report: WorkbookReport) -> None:
+    """Render one compact quality summary with expandable source details."""
+    formula_warnings = [warning for warning in report.warnings if "formula error" in warning.lower() or "cached value" in warning.lower()]
+    review_warnings = [warning for warning in report.warnings if warning not in formula_warnings]
+    critical = sum(item.formula_errors for item in report.sheet_reports.values())
+    missing_cached = sum(item.missing_formula_results for item in report.sheet_reports.values())
+    st.warning(
+        f"Data quality: {critical} formula error(s), {missing_cached} missing cached result(s), and {len(review_warnings)} review warning(s). Expand details for worksheets and cells.",
+        icon="⚠️",
+    )
+    with st.expander("Data-quality details"):
+        if report.warnings:
+            for warning in report.warnings:
+                st.caption(f"• {warning}")
+        details = report_to_frame(report)
+        details = details[(details["Formula errors"] > 0) | (details["Missing cached results"] > 0) | (details["Status"].astype(str).str.contains("Imported", na=False))]
+        st.dataframe(details, width="stretch", hide_index=True)
 
 
 def render_chart(builder, label: str, alt: str):

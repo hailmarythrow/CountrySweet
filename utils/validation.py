@@ -143,6 +143,10 @@ def apply_filters(frame: pd.DataFrame, filters: dict[str, list[str]]) -> pd.Data
 
 
 def source_period(frame: pd.DataFrame) -> str:
+    if "source_period" in frame and frame["source_period"].notna().any():
+        labels = [str(value) for value in frame["source_period"].dropna().unique() if str(value).strip()]
+        if labels:
+            return " · ".join(labels[:3])
     if "reporting_date" in frame and frame["reporting_date"].notna().any():
         dates = frame["reporting_date"].dropna()
         return f"{dates.min():%b %d, %Y} – {dates.max():%b %d, %Y}"
