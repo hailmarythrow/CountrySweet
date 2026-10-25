@@ -174,18 +174,18 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div.st-key-header_copy [data-testid="stMarkdownContainer"] p {{ margin: 0 !important; }}
     div.st-key-hero_header {{
         position: relative; isolation: isolate; background: #07111B;
-        border: none; outline: none; box-shadow: none; border-radius: 0; padding: .55rem .85rem .45rem; margin-bottom: .65rem;
+        border: none; outline: none; box-shadow: none; border-radius: 0; padding: 2rem .85rem .45rem; margin-bottom: .65rem;
     }}
     div.st-key-hero_header::before {{
-        content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+        content: ""; position: absolute; top: -12px; right: 0; bottom: 0; left: 0; z-index: 0; pointer-events: none;
         background-image:
             linear-gradient(to right, #07111B 0, rgba(7,17,27,0) 38px, rgba(7,17,27,0) calc(100% - 30px), #07111B 100%),
             {header_background};
         background-position: center, center;
-        background-size: 100% 100%, cover;
+        background-size: 100% 100%, 100% 100%, cover;
         background-repeat: no-repeat;
-        -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 36%, #000 82%, transparent 100%);
-        mask-image: linear-gradient(to bottom, transparent 0%, #000 36%, #000 82%, transparent 100%);
+        -webkit-mask-image: linear-gradient(to bottom, transparent 0px, #000 30px, #000 calc(100% - 52px), transparent 100%);
+        mask-image: linear-gradient(to bottom, transparent 0px, #000 30px, #000 calc(100% - 52px), transparent 100%);
         -webkit-mask-size: 100% 100%; mask-size: 100% 100%;
         -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
     }}
