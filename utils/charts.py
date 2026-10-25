@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 
 def inventory_comparison(frame: pd.DataFrame):
@@ -35,6 +36,49 @@ def inventory_timeline(frame: pd.DataFrame):
 def classification_comparison(frame: pd.DataFrame):
     summary = frame.dropna(subset=["classification"]).groupby("classification", as_index=False)["stored_lbs"].sum(min_count=1)
     return px.bar(summary, x="classification", y="stored_lbs", color="classification", labels={"stored_lbs": "Stored pounds", "classification": "Classification"}, color_discrete_map={"Organic": "#2f855a", "Conventional": "#e07a3f"})
+
+
+def inventory_mix_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the verified stored-pound population used by the mix chart."""
+    if "classification" not in frame or "stored_lbs" not in frame:
+        return pd.DataFrame(columns=["classification", "stored_lbs"])
+    summary = (
+        frame.dropna(subset=["classification", "stored_lbs"])
+        .groupby("classification", as_index=False)["stored_lbs"]
+        .sum(min_count=1)
+    )
+    return summary.dropna(subset=["stored_lbs"])
+
+
+def inventory_mix_donut(frame: pd.DataFrame):
+    """Show stored pounds by verified classification with a compact center total."""
+    summary = inventory_mix_summary(frame)
+    if summary.empty:
+        return None
+    colors = {"Organic": "#3c9672", "Conventional": "#f47c35"}
+    total_stored = float(summary["stored_lbs"].sum())
+    fig = go.Figure(
+        go.Pie(
+            labels=summary["classification"],
+            values=summary["stored_lbs"],
+            hole=0.60,
+            sort=False,
+            marker=dict(colors=[colors.get(value, "#8fa3b5") for value in summary["classification"]]),
+            textinfo="none",
+            hovertemplate="%{label}<br>%{value:,.0f} lbs<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=210,
+        showlegend=False,
+        annotations=[
+            dict(text=f"<b>{total_stored:,.0f}</b>", x=0.5, y=0.58, xref="paper", yref="paper", showarrow=False, font=dict(size=20, color="#F5F7FA")),
+            dict(text="<b>lbs</b>", x=0.5, y=0.45, xref="paper", yref="paper", showarrow=False, font=dict(size=17, color="#F5F7FA")),
+            dict(text="in storage", x=0.5, y=0.345, xref="paper", yref="paper", showarrow=False, font=dict(size=12, color="#B9C7D5")),
+        ],
+    )
+    return fig
 
 
 def dimension_bar(frame: pd.DataFrame, dimension: str, title: str):
