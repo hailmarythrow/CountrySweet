@@ -1,9 +1,20 @@
 """Reusable Plotly charts for verified workbook fields."""
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+
+
+def _display_variety(value: object) -> str | None:
+    """Normalize embedded classification descriptions for chart labels only."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    marker = re.search(r"\b(?:Conv\.|Org\.)\s+([A-Za-z][A-Za-z'’-]*)", text, flags=re.IGNORECASE)
+    return marker.group(1).strip() if marker else text
 
 
 def inventory_comparison(frame: pd.DataFrame):
@@ -16,6 +27,183 @@ def inventory_comparison(frame: pd.DataFrame):
     fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0), margin=dict(l=190, r=30, t=100, b=70), height=max(420, chart_data["product_label"].nunique() * 72 + 120))
     fig.update_yaxes(automargin=True)
     fig.update_xaxes(automargin=True)
+    return fig
+
+
+def inventory_periods(frame: pd.DataFrame, state: str) -> pd.DataFrame:
+    """Return distinct workbook periods for an ACTUAL or FORECAST state.
+
+    The Forecasted Inventory Levels parser preserves the workbook's state, week,
+    and reporting-date fields. This helper keeps period selection tied to those
+    source values instead of deriving a new forecast calendar.
+    """
+    required = {"inventory_state", "week"}
+    if not required.issubset(frame.columns):
+        return pd.DataFrame(columns=["key", "label", "week", "year", "reporting_date"])
+
+    subset = frame[frame["inventory_state"].astype("string").str.casefold() == state.casefold()].copy()
+    subset["week"] = pd.to_numeric(subset["week"], errors="coerce")
+    subset = subset.dropna(subset=["week"])
+    if subset.empty:
+        return pd.DataFrame(columns=["key", "label", "week", "year", "reporting_date"])
+
+    group_fields = ["week"]
+    if "year" in subset.columns and subset["year"].notna().any():
+        group_fields.insert(0, "year")
+    aggregate = {"reporting_date": ("reporting_date", "max")} if "reporting_date" in subset.columns else {}
+    periods = subset.groupby(group_fields, dropna=False, as_index=False).agg(**aggregate) if aggregate else subset[group_fields].drop_duplicates()
+    if "reporting_date" not in periods:
+        periods["reporting_date"] = pd.NaT
+    periods["reporting_date"] = pd.to_datetime(periods["reporting_date"], errors="coerce")
+    periods["week"] = pd.to_numeric(periods["week"], errors="coerce")
+    if "year" in periods:
+        periods["year"] = pd.to_numeric(periods["year"], errors="coerce")
+
+    def period_label(row: pd.Series) -> str:
+        week = f"Week {int(row['week'])}" if pd.notna(row["week"]) else "Week unavailable"
+        date = row.get("reporting_date")
+        date_label = f" · {date:%b %d, %Y}" if pd.notna(date) else ""
+        return f"{week}{date_label}"
+
+    def period_key(row: pd.Series) -> str:
+        year = int(row["year"]) if "year" in row and pd.notna(row["year"]) else ""
+        week = int(row["week"]) if pd.notna(row["week"]) else ""
+        date = row["reporting_date"].isoformat() if pd.notna(row["reporting_date"]) else ""
+        return f"{year}|{week}|{date}"
+
+    periods["label"] = periods.apply(period_label, axis=1)
+    periods["key"] = periods.apply(period_key, axis=1)
+    periods["_sort_date"] = periods["reporting_date"].fillna(pd.Timestamp.min)
+    periods["_sort_key"] = periods["_sort_date"].astype("int64")
+    periods = periods.sort_values(["_sort_key", "week"], kind="stable").reset_index(drop=True)
+    return periods.reset_index(drop=True)
+
+
+def inventory_current_vs_projected(
+    frame: pd.DataFrame,
+    forecast_period_key: str | None = None,
+    group_by: str = "Variety",
+):
+    """Compare the latest ACTUAL inventory with a selected FORECAST period."""
+    required = {"inventory_state", "week", "stored_lbs"}
+    if not required.issubset(frame.columns):
+        return None
+
+    actual_periods = inventory_periods(frame, "Actual")
+    forecast_periods = inventory_periods(frame, "Forecast")
+    if actual_periods.empty or forecast_periods.empty:
+        return None
+    actual_period = actual_periods.iloc[-1]
+    if forecast_period_key and forecast_period_key in forecast_periods["key"].tolist():
+        forecast_period = forecast_periods.loc[forecast_periods["key"] == forecast_period_key].iloc[0]
+    else:
+        later = forecast_periods[forecast_periods["_sort_key"] > actual_period["_sort_key"]] if "_sort_key" in forecast_periods else forecast_periods.iloc[0:0]
+        forecast_period = (later.iloc[0] if not later.empty else forecast_periods.iloc[0])
+
+    def period_mask(source: pd.DataFrame, period: pd.Series, state: str) -> pd.Series:
+        mask = source["inventory_state"].astype("string").str.casefold().eq(state.casefold())
+        mask &= pd.to_numeric(source["week"], errors="coerce").eq(float(period["week"]))
+        if "year" in source and "year" in period and pd.notna(period["year"]):
+            mask &= pd.to_numeric(source["year"], errors="coerce").eq(float(period["year"]))
+        return mask
+
+    actual_rows = frame.loc[period_mask(frame, actual_period, "Actual")].copy()
+    forecast_rows = frame.loc[period_mask(frame, forecast_period, "Forecast")].copy()
+    grouped_by_variety = group_by.casefold() == "variety"
+    if grouped_by_variety:
+        identity_fields = ["variety"] if "variety" in frame.columns else ["product"]
+    else:
+        identity_fields = [field for field in ["product", "variety", "classification", "size", "packaging_type"] if field in frame.columns]
+    if not identity_fields or actual_rows.empty or forecast_rows.empty:
+        return None
+
+    actual_summary = actual_rows.groupby(identity_fields, dropna=False, as_index=False)["stored_lbs"].sum(min_count=1).rename(columns={"stored_lbs": "actual_lbs"})
+    forecast_summary = forecast_rows.groupby(identity_fields, dropna=False, as_index=False)["stored_lbs"].sum(min_count=1).rename(columns={"stored_lbs": "projected_lbs"})
+    summary = actual_summary.merge(forecast_summary, on=identity_fields, how="outer")
+
+    def product_label(row: pd.Series) -> str:
+        if grouped_by_variety:
+            value = row.get("variety")
+            if value is not None and not pd.isna(value) and str(value).strip():
+                return _display_variety(value) or "Other / unclassified"
+            return "Other / unclassified"
+        parts = []
+        for field in ["variety", "size", "classification"]:
+            value = row.get(field)
+            if value is not None and not pd.isna(value) and str(value).strip():
+                text = _display_variety(value) if field == "variety" else str(value).strip()
+                if text not in parts:
+                    parts.append(text)
+        if parts:
+            return " · ".join(parts)
+        product = row.get("product")
+        return "Unknown product" if product is None or pd.isna(product) else str(product).strip()
+
+    summary["product_label"] = summary.apply(product_label, axis=1)
+    summary = summary.sort_values("product_label", key=lambda values: values.astype("string").str.casefold(), kind="stable")
+    actual_label = str(actual_period["label"])
+    forecast_label = str(forecast_period["label"])
+    rows: list[dict[str, object]] = []
+    for _, item in summary.iterrows():
+        actual_value = pd.to_numeric(item.get("actual_lbs"), errors="coerce")
+        projected_value = pd.to_numeric(item.get("projected_lbs"), errors="coerce")
+        actual_display = float(actual_value) if pd.notna(actual_value) else None
+        projected_display = float(projected_value) if pd.notna(projected_value) else None
+        net_change = projected_display - actual_display if actual_display is not None and projected_display is not None else None
+        base = {
+            "product_label": item["product_label"],
+            "actual_week": actual_label,
+            "actual_lbs": actual_display,
+            "forecast_week": forecast_label,
+            "projected_lbs": projected_display,
+            "net_change_lbs": net_change,
+        }
+        if actual_display is not None:
+            rows.append({**base, "measure": "Actual Inventory", "pounds": actual_display})
+        if projected_display is not None:
+            rows.append({**base, "measure": "Projected Inventory", "pounds": projected_display})
+    chart_data = pd.DataFrame(rows)
+    if chart_data.empty:
+        return None
+
+    fig = px.bar(
+        chart_data,
+        x="pounds",
+        y="product_label",
+        color="measure",
+        orientation="h",
+        barmode="group",
+        custom_data=["product_label", "actual_week", "actual_lbs", "forecast_week", "projected_lbs", "net_change_lbs"],
+        labels={"product_label": "Variety" if grouped_by_variety else "Product", "pounds": "Pounds", "measure": ""},
+        color_discrete_map={"Actual Inventory": "#32936B", "Projected Inventory": "#F47C35"},
+    )
+    actual_hover = (
+        "<b>%{customdata[0]}</b><br>"
+        "Actual inventory week: %{customdata[1]}<br>"
+        "Actual inventory: %{customdata[2]:,.0f} lbs<br>"
+        "Projected net change: %{customdata[5]:+,.0f} lbs<extra></extra>"
+    )
+    projected_hover = (
+        "<b>%{customdata[0]}</b><br>"
+        "Selected forecast week: %{customdata[3]}<br>"
+        "Projected inventory: %{customdata[4]:,.0f} lbs<br>"
+        "Projected net change: %{customdata[5]:+,.0f} lbs<extra></extra>"
+    )
+    for trace in fig.data:
+        trace.hovertemplate = actual_hover if trace.name == "Actual Inventory" else projected_hover
+    # Plotly renders the first horizontal grouped trace below the second. Keep
+    # the legend ranked Actual → Projected while placing Actual above Projected.
+    fig.data = tuple(sorted(fig.data, key=lambda trace: 0 if trace.name == "Projected Inventory" else 1))
+    for trace in fig.data:
+        trace.legendrank = 1 if trace.name == "Actual Inventory" else 2
+    fig.update_layout(
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0),
+        margin=dict(l=210, r=30, t=100, b=70),
+        height=max(400, min(720, chart_data["product_label"].nunique() * 55 + 140)),
+        bargap=0.24,
+    )
+    fig.update_yaxes(automargin=True, categoryorder="array", categoryarray=summary["product_label"].tolist(), tickfont=dict(size=12))
+    fig.update_xaxes(automargin=True, zeroline=True, zerolinecolor="#718096", zerolinewidth=1)
     return fig
 
 

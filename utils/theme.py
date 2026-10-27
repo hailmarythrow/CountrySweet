@@ -103,6 +103,10 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div[data-testid="stMetric"] {{ background: var(--cs-card); border: 1px solid var(--cs-border); padding: .65rem .8rem; border-radius: .65rem; }}
     div[data-testid="stMetric"] [data-testid="stMetricLabel"], div[data-testid="stMetric"] [data-testid="stMetricValue"], div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{ color: var(--cs-text) !important; }}
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {{ font-size: 1.45rem; }}
+    div.st-key-contribution_metric [data-testid="stMetricLabel"],
+    div.st-key-upcoming_planned_metric [data-testid="stMetricLabel"] {{ font-size: 16px !important; font-weight: 600 !important; }}
+    div.st-key-contribution_metric [data-testid="stMetricValue"],
+    div.st-key-upcoming_planned_metric [data-testid="stMetricValue"] {{ font-size: 25px !important; font-weight: 700 !important; white-space: nowrap; }}
     div[data-baseweb="select"] > div {{ background: var(--cs-input); color: var(--cs-text); border-color: var(--cs-border); }}
     div[data-baseweb="select"] span, div[data-baseweb="select"] input {{ color: var(--cs-text) !important; }}
     .cs-inline-icon {{ display: inline-block; vertical-align: middle; flex: 0 0 auto; }}
@@ -115,6 +119,23 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     .cs-upload-heading {{ color: var(--cs-heading); font-size: 17px; font-weight: 700; line-height: 1.2; margin: 0 0 4px; }}
     .cs-upload-subtitle {{ color: var(--cs-text); font-size: 13px; font-weight: 400; line-height: 1.3; margin: 0 0 3px; }}
     .cs-upload-support {{ color: var(--cs-muted); font-size: 12px; font-weight: 400; line-height: 1.25; margin: 0; }}
+    .cs-upload-feedback {{ width: 100%; box-sizing: border-box; display: flex; align-items: flex-start; gap: .8rem; margin: .65rem 0 .8rem; padding: .85rem 1rem; border-radius: .65rem; }}
+    .cs-upload-feedback--success {{ background: rgba(66,165,131,.16); border: 1px solid rgba(66,165,131,.58); }}
+    .cs-upload-feedback--error {{ background: rgba(220,80,86,.16); border: 1px solid rgba(220,80,86,.62); }}
+    .cs-upload-feedback--quality {{ background: rgba(244,190,70,.16); border: 1px solid rgba(244,190,70,.62); }}
+    .cs-upload-feedback-icon {{ flex: 0 0 2rem; width: 2rem; height: 2rem; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; font-size: 1.45rem; line-height: 1; font-weight: 800; }}
+    .cs-upload-feedback--success .cs-upload-feedback-icon {{ color: #B9F3D7; background: #2D8B69; }}
+    .cs-upload-feedback--error .cs-upload-feedback-icon {{ color: #FFE4E6; background: #B9424B; }}
+    .cs-upload-feedback--quality .cs-upload-feedback-icon {{ color: #FFF5D1; background: #A87316; }}
+    .cs-upload-feedback-copy {{ min-width: 0; }}
+    .cs-upload-feedback-title {{ color: var(--cs-heading); font-size: 1rem; line-height: 1.25; font-weight: 750; margin: 0 0 .2rem; }}
+    .cs-upload-feedback-message {{ color: var(--cs-text); font-size: .86rem; line-height: 1.4; margin: 0; }}
+    .cs-upload-feedback-file {{ color: var(--cs-muted); font-size: .78rem; line-height: 1.3; margin-top: .3rem; overflow-wrap: anywhere; }}
+    .cs-demo-mode {{ width: 100%; box-sizing: border-box; display: flex; align-items: center; gap: .75rem; margin: .3rem 0 .75rem; padding: 18px; background: rgba(244,124,53,.10); border: 1px solid rgba(244,124,53,.58); border-radius: .55rem; }}
+    .cs-demo-mode-icon {{ flex: 0 0 28px; width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; background: #F47C35; color: #091522; font-size: 1rem; line-height: 1; font-weight: 800; font-family: Georgia, serif; }}
+    .cs-demo-mode-copy {{ min-width: 0; }}
+    .cs-demo-mode-title {{ color: var(--cs-heading); font-size: 20px; line-height: 1.2; font-weight: 700; margin: 0 0 .12rem; }}
+    .cs-demo-mode-message {{ color: var(--cs-text); font-size: 15px; line-height: 1.35; margin: 0; }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] {{ background: transparent; border: 0; padding: 0; margin: 0; }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] section, div.st-key-upload_panel [data-testid="stFileUploaderDropzone"] {{ border: 0 !important; background: transparent !important; padding: 0 !important; min-height: 0 !important; }}
     div.st-key-upload_panel [data-testid="stFileUploaderDropzone"] {{ display: flex; flex-direction: column; gap: 0; }}
@@ -234,12 +255,33 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     .cs-kpi-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; margin: .65rem 0 .5rem; }}
     .cs-kpi-card {{ background: var(--cs-card); border: 1px solid var(--cs-border); border-radius: .65rem; padding: .7rem .85rem; height: 7.5rem; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }}
     .cs-kpi-icon {{ color: #3c9672; line-height: 1; margin-bottom: .45rem; }}
-    .cs-kpi-icon .cs-inline-icon {{ width: 1.45rem; height: 1.45rem; }}
+    .cs-kpi-icon .cs-inline-icon {{ width: 50px; height: 50px; }}
     .cs-kpi-card.demand .cs-kpi-icon {{ color: #f47c35; }}
     .cs-kpi-card.balance .cs-kpi-icon {{ color: #f4b183; }}
     .cs-kpi-label {{ color: var(--cs-muted); font-size: .86rem; }}
     .cs-kpi-value {{ color: var(--cs-heading); font-size: 1.5rem; font-weight: 700; margin-top: .2rem; }}
     .cs-kpi-support {{ color: var(--cs-muted); font-size: .74rem; margin-top: auto; line-height: 1.15; }}
+    .cs-kpi-card.storage {{ justify-content: center; }}
+    .cs-kpi-card.storage .cs-kpi-storage-content {{ align-self: stretch; display: grid; grid-template-columns: 70px minmax(0, 1fr); column-gap: 15px; align-items: center; width: auto; max-width: none; min-width: 0; }}
+    .cs-kpi-card.storage .cs-kpi-icon {{ display: flex; align-items: center; justify-content: center; width: 70px; height: 50px; margin: 0; }}
+    .cs-kpi-card.storage .cs-kpi-storage-copy {{ min-width: 0; display: flex; flex-direction: column; padding-top: .05rem; }}
+    .cs-kpi-card.storage .cs-kpi-label {{ color: var(--cs-heading); font-size: 16px; font-weight: 700; line-height: 1.2; margin: 0 0 .15rem; }}
+    .cs-kpi-card.storage .cs-kpi-value {{ font-size: 28px; margin-top: 0; line-height: 1.1; white-space: nowrap; }}
+    .cs-kpi-card.storage .cs-kpi-support {{ font-size: 13px; margin-top: .25rem; }}
+    .cs-kpi-card.demand {{ justify-content: center; }}
+    .cs-kpi-card.demand .cs-kpi-demand-content {{ align-self: stretch; display: grid; grid-template-columns: 70px minmax(0, 1fr); column-gap: 15px; align-items: center; width: auto; min-width: 0; }}
+    .cs-kpi-card.demand .cs-kpi-icon {{ display: flex; align-items: center; justify-content: center; width: 70px; height: 50px; margin: 0; }}
+    .cs-kpi-card.demand .cs-kpi-demand-copy {{ min-width: 0; display: flex; flex-direction: column; padding-top: .05rem; }}
+    .cs-kpi-card.demand .cs-kpi-label {{ color: var(--cs-heading); font-size: 18px; font-weight: 700; line-height: 1.2; margin: 0 0 .15rem; }}
+    .cs-kpi-card.demand .cs-kpi-value {{ font-size: 32px; margin-top: 0; line-height: 1.1; white-space: nowrap; }}
+    .cs-kpi-card.demand .cs-kpi-support {{ font-size: 13px; margin-top: .25rem; }}
+    .cs-kpi-card.balance {{ justify-content: center; }}
+    .cs-kpi-card.balance .cs-kpi-balance-content {{ align-self: stretch; display: grid; grid-template-columns: 70px minmax(0, 1fr); column-gap: 15px; align-items: center; width: auto; min-width: 0; }}
+    .cs-kpi-card.balance .cs-kpi-icon {{ display: flex; align-items: center; justify-content: center; width: 70px; height: 50px; margin: 0; }}
+    .cs-kpi-card.balance .cs-kpi-balance-copy {{ min-width: 0; display: flex; flex-direction: column; padding-top: .05rem; }}
+    .cs-kpi-card.balance .cs-kpi-label {{ color: var(--cs-heading); font-size: 18px; font-weight: 700; line-height: 1.2; margin: 0 0 .15rem; }}
+    .cs-kpi-card.balance .cs-kpi-value {{ font-size: 32px; margin-top: 0; line-height: 1.1; white-space: nowrap; }}
+    .cs-kpi-card.balance .cs-kpi-support {{ font-size: 13px; margin-top: .25rem; }}
     div[data-testid="stAlert"] {{ padding: .5rem .7rem; margin: .35rem 0; }}
     div[data-testid="stExpander"] {{ margin: .25rem 0; }}
     @media (max-width: 760px) {{

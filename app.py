@@ -19,7 +19,8 @@ from utils.charts import (
     dimension_bar,
     inventory_mix_donut,
     inventory_mix_summary,
-    inventory_comparison,
+    inventory_current_vs_projected,
+    inventory_periods,
     inventory_timeline,
     load_comparison,
     loads_timeline,
@@ -28,8 +29,8 @@ from utils.charts import (
 )
 from utils.excel_loader import REPORT_SCHEMA_VERSION, frame_for, load_inventory_workbook, normalize_frame, report_to_frame, timings_to_frame, workbook_content_id
 from utils.theme import apply_theme
-from utils.ui import render_chart, render_quality_summary, source_caption
-from utils.validation import apply_filters, filter_caption, options, source_period
+from utils.ui import render_chart, render_quality_summary, render_upload_error, render_upload_success, source_caption
+from utils.validation import apply_filters, options, source_period
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "Country_Sweet_Produce_Logo_HD.png"
 HEADER_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "backdrop.png"
@@ -65,6 +66,15 @@ DEFAULT_LOCATION = {
 # Manual refresh remains implemented for a future persistent OneDrive,
 # SharePoint, or local connection, but is temporarily disabled in the UI.
 ENABLE_WORKBOOK_REFRESH = False
+# Keep parser diagnostics and timing calculations active, but hide the
+# technical worksheet report from the normal Executive Overview interface.
+SHOW_TECHNICAL_VALIDATION_DETAILS = False
+# Keep workbook quality detection and reports active, but temporarily hide
+# the end-user warning/expander until the team is ready to surface them again.
+SHOW_DATA_QUALITY_UI = False
+# Keep chart timing collection active, but hide the technical timing table
+# from the everyday dashboard interface.
+SHOW_PERFORMANCE_UI = False
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -181,6 +191,9 @@ def _activate_workbook(
     st.session_state.active_workbook_name = name
     st.session_state.active_workbook_id = content_id
     st.session_state.active_workbook_source_type = source_type
+    # Keep the active session aligned with parser changes. This prevents a
+    # previously parsed snapshot from bypassing a newer classification schema.
+    st.session_state.active_workbook_report_schema = REPORT_SCHEMA_VERSION
     if content is not None:
         st.session_state.active_workbook_content = content
     st.session_state.active_workbook_path = str(path) if path is not None else ""
@@ -288,12 +301,43 @@ def render_kpi_cards(stored: float | None, demand: float | None, balance: float 
     ]
     markup = "<div class='cs-kpi-grid'>"
     for style, icon, label, value, support in cards:
-        markup += (
-            f"<div class='cs-kpi-card {style}'><div class='cs-kpi-icon'>{dashboard_icon(icon)}</div>"
-            f"<div class='cs-kpi-label'>{html.escape(label)}</div>"
-            f"<div class='cs-kpi-value'>{html.escape(value)}</div>"
-            f"<div class='cs-kpi-support'>{html.escape(support)}</div></div>"
-        )
+        if style == "storage":
+            markup += (
+                "<div class='cs-kpi-card storage'>"
+                f"<div class='cs-kpi-storage-content'><div class='cs-kpi-icon'>{dashboard_icon(icon, size=50)}</div>"
+                "<div class='cs-kpi-storage-copy'>"
+                f"<div class='cs-kpi-label'>{html.escape(label)}</div>"
+                f"<div class='cs-kpi-value'>{html.escape(value)}</div>"
+                f"<div class='cs-kpi-support'>{html.escape(support)}</div>"
+                "</div></div></div>"
+            )
+        elif style == "demand":
+            markup += (
+                "<div class='cs-kpi-card demand'>"
+                f"<div class='cs-kpi-demand-content'><div class='cs-kpi-icon'>{dashboard_icon(icon, size=50)}</div>"
+                "<div class='cs-kpi-demand-copy'>"
+                f"<div class='cs-kpi-label'>{html.escape(label)}</div>"
+                f"<div class='cs-kpi-value'>{html.escape(value)}</div>"
+                f"<div class='cs-kpi-support'>{html.escape(support)}</div>"
+                "</div></div></div>"
+            )
+        elif style == "balance":
+            markup += (
+                "<div class='cs-kpi-card balance'>"
+                f"<div class='cs-kpi-balance-content'><div class='cs-kpi-icon'>{dashboard_icon(icon, size=50)}</div>"
+                "<div class='cs-kpi-balance-copy'>"
+                f"<div class='cs-kpi-label'>{html.escape(label)}</div>"
+                f"<div class='cs-kpi-value'>{html.escape(value)}</div>"
+                f"<div class='cs-kpi-support'>{html.escape(support)}</div>"
+                "</div></div></div>"
+            )
+        else:
+            markup += (
+                f"<div class='cs-kpi-card {style}'><div class='cs-kpi-icon'>{dashboard_icon(icon, size=50)}</div>"
+                f"<div class='cs-kpi-label'>{html.escape(label)}</div>"
+                f"<div class='cs-kpi-value'>{html.escape(value)}</div>"
+                f"<div class='cs-kpi-support'>{html.escape(support)}</div></div>"
+            )
     st.markdown(markup + "</div>", unsafe_allow_html=True)
 
 
@@ -520,7 +564,48 @@ def render_top_header() -> object | None:
         header_col, right_col = st.columns([3.8, 1.8], gap="medium", vertical_alignment="top")
         with header_col:
             with st.container(key="header_copy"):
-                st.caption(f"{date} • {clock}")
+                st.html(
+                    """
+                    <div id="cs-live-clock-shell" style="height:34px; margin:0; padding:0; overflow:hidden;">
+                        <div id="cs-live-clock" role="status" aria-live="polite" style="color:#B9C7D5; font-family:sans-serif; font-size:14px; font-weight:400; line-height:17.5px; white-space:nowrap;"></div>
+                    </div>
+                    <script>
+                    (() => {
+                        const target = document.getElementById("cs-live-clock");
+                        if (!target) return;
+                        const timeZone = "America/Los_Angeles";
+                        const formatter = new Intl.DateTimeFormat("en-US", {
+                            timeZone,
+                            weekday: "long",
+                            month: "long",
+                            day: "2-digit",
+                            year: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                            hour12: true,
+                            timeZoneName: "short"
+                        });
+                        const updateClock = () => {
+                            const parts = Object.fromEntries(
+                                formatter.formatToParts(new Date())
+                                    .filter(({ type }) => type !== "literal")
+                                    .map(({ type, value }) => [type, value])
+                            );
+                            target.textContent = `${parts.weekday}, ${parts.month} ${parts.day}, ${parts.year} • ${parts.hour}:${parts.minute}:${parts.second} ${parts.dayPeriod} ${parts.timeZoneName}`;
+                        };
+                        updateClock();
+                        const timer = window.setInterval(updateClock, 1000);
+                        document.addEventListener("visibilitychange", updateClock);
+                        window.addEventListener("beforeunload", () => {
+                            window.clearInterval(timer);
+                            document.removeEventListener("visibilitychange", updateClock);
+                        }, { once: true });
+                    })();
+                    </script>
+                    """,
+                    unsafe_allow_javascript=True,
+                )
                 st.subheader(f"{greeting},")
                 st.write("A clear view of stored inventory, demand coverage, and product mix.")
         with right_col:
@@ -677,7 +762,13 @@ if uploaded is not None and not refresh_clicked:
     upload_id = workbook_content_id(uploaded_bytes)
     active_id = st.session_state.get("active_workbook_id")
     active_source = st.session_state.get("active_workbook_source_type")
-    if active_id == upload_id and active_source == "upload" and previous_report is not None:
+    active_schema = st.session_state.get("active_workbook_report_schema")
+    if (
+        active_id == upload_id
+        and active_source == "upload"
+        and active_schema == REPORT_SCHEMA_VERSION
+        and previous_report is not None
+    ):
         workbook_report = previous_report
         # A replacement can be byte-for-byte identical while arriving under
         # a new filename. Reuse the verified parse, but still update the
@@ -724,11 +815,31 @@ if uploaded is not None and not refresh_clicked:
                 st.session_state.active_workbook_error = load_error
                 if previous_report is not None:
                     st.session_state.active_workbook_stale = True
-                upload_status.update(label="Workbook could not be processed; previous data retained", state="error")
+                upload_status.update(label="Upload failed — see details below", state="error")
     if workbook_report is None and previous_report is not None:
         workbook_report = previous_report
 elif workbook_report is None and previous_report is not None:
     workbook_report = previous_report
+
+# Keep upload state immediately visible above the worksheet selector. Demo mode
+# intentionally has no success banner, and a failed replacement takes
+# precedence over the previous workbook's success state.
+active_source = st.session_state.get("active_workbook_source_type", "")
+if load_error:
+    render_upload_error(
+        load_error,
+        filename=getattr(uploaded, "name", None),
+        retained_previous=previous_report is not None,
+    )
+elif workbook_report is not None and active_source in {"upload", "local_link"}:
+    primary_sheet = workbook_report.preferred_sheet or workbook_report.semantic_sheets.get("inventory")
+    primary_frame = workbook_report.frames.get(primary_sheet) if primary_sheet else None
+    loaded_records = verified_record_count(primary_frame) if primary_frame is not None else 0
+    render_upload_success(
+        st.session_state.get("active_workbook_name") or previous_name or "Loaded workbook",
+        loaded_records,
+        source_type=active_source,
+    )
 
 if workbook_report is None:
     df = demo_data()
@@ -765,12 +876,6 @@ if workbook_report is not None:
         source_status = "Local workbook · verified data"
         if st.session_state.get("active_workbook_stale"):
             source_status = "Local workbook · showing last successful update"
-if load_error:
-    if previous_report is not None:
-        st.warning(f"The workbook could not be loaded: {load_error} The previous successfully loaded data remains active.")
-    else:
-        st.warning(f"The workbook could not be loaded: {load_error} Demo data remains active.")
-
 timeline_filter_frame = None
 if workbook_report is not None:
     _, timeline_filter_frame = frame_for(workbook_report, "inventory_timeline")
@@ -837,32 +942,35 @@ balance = stored - demand if stored is not None and demand is not None else None
 no_matching_records = bool(df is not None and not df.empty and filtered.empty)
 missing_metric_label = "No matching records" if no_matching_records else ("Not available from selected worksheet" if workbook_report else "Unavailable")
 render_kpi_cards(stored, demand, balance, missing_metric_label)
-status_note = f"Showing {len(filtered):,} records · {filter_caption(filters)} · Source: {source_name} · {source_sheet or 'No verified worksheet'} · {source_status}"
-st.caption(status_note)
 
 if workbook_report:
-    render_quality_summary(workbook_report)
-    with st.expander("Workbook validation and worksheet details"):
-        st.dataframe(
-            pd.DataFrame([{"Stage": stage, "Records": count} for stage, count in record_stage_counts.items()]),
-            width="stretch", hide_index=True,
-        )
-        st.write(f"Available worksheets: {', '.join(workbook_report.available_sheets)}")
-        st.dataframe(report_to_frame(workbook_report), width="stretch", hide_index=True)
-        st.caption(f"Deferred worksheets: {len(workbook_report.deferred_sheets)}. They are not opened or converted until explicitly requested.")
-        st.dataframe(timings_to_frame(workbook_report), width="stretch", hide_index=True)
+    if SHOW_DATA_QUALITY_UI:
+        render_quality_summary(workbook_report)
+    if SHOW_TECHNICAL_VALIDATION_DETAILS:
+        with st.expander("Workbook validation and worksheet details"):
+            st.dataframe(
+                pd.DataFrame([{"Stage": stage, "Records": count} for stage, count in record_stage_counts.items()]),
+                width="stretch", hide_index=True,
+            )
+            st.write(f"Available worksheets: {', '.join(workbook_report.available_sheets)}")
+            st.dataframe(report_to_frame(workbook_report), width="stretch", hide_index=True)
+            st.caption(f"Deferred worksheets: {len(workbook_report.deferred_sheets)}. They are not opened or converted until explicitly requested.")
+            st.dataframe(timings_to_frame(workbook_report), width="stretch", hide_index=True)
 if workbook_report is not None and source_sheet == workbook_report.semantic_sheets.get("inventory") and not filtered.empty:
     model_week = ", ".join(options(filtered, "week")) or "selected week"
     contribution = pd.to_numeric(filtered.get("contribution_margin"), errors="coerce").sum(min_count=1) if "contribution_margin" in filtered else None
     upcoming = pd.to_numeric(filtered.get("upcoming_demand_lbs"), errors="coerce").sum(min_count=1) if "upcoming_demand_lbs" in filtered else None
     st.caption(f"Current Week Model supplied totals · Week {model_week}")
     cm_col, upcoming_col = st.columns(2)
-    cm_col.metric("Contribution margin", f"${contribution:,.0f}" if pd.notna(contribution) else "Not available from selected worksheet")
-    upcoming_col.metric("Upcoming planned pounds", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
+    with cm_col:
+        with st.container(key="contribution_metric"):
+            st.metric("Contribution margin", f"${contribution:,.0f}" if pd.notna(contribution) else "Not available from selected worksheet")
+    with upcoming_col:
+        with st.container(key="upcoming_planned_metric"):
+            st.metric("Upcoming planned pounds", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
 
 with st.container(key="filters_panel", border=True):
     st.markdown("#### Filters")
-    st.caption("Leave a filter blank to include all available values.")
     filter_row_one = st.columns(4, gap="small")
     with filter_row_one[0]:
         st.multiselect("Year", year_options, key=filter_keys["year"], placeholder="All years")
@@ -959,15 +1067,51 @@ if active_page == "Settings":
 
 if active_page == "Executive Overview":
     st.subheader("Executive overview")
-    source_caption(source_sheet, filtered, period)
+    if workbook_report is None:
+        st.markdown(
+            "<div class='cs-demo-mode'>"
+            "<div class='cs-demo-mode-icon' aria-hidden='true'>i</div>"
+            "<div class='cs-demo-mode-copy'>"
+            "<div class='cs-demo-mode-title'>Demo Mode</div>"
+            "<div class='cs-demo-mode-message'>You're viewing sample inventory data. Upload your Excel workbook to see your company's actual data.</div>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
     if filtered.empty:
         st.warning("No rows match the current filters. Reset or broaden the filters to continue.", icon="⚠️")
     elif "stored_lbs" in filtered:
         overview_chart_col, mix_col = st.columns([2, 1], gap="medium", vertical_alignment="top")
         with overview_chart_col:
             with st.container(key="inventory_panel", border=True):
-                st.markdown("#### Inventory vs. forecast demand")
-                render_chart(lambda: inventory_comparison(filtered), "executive_overview", "Stored inventory and forecast demand by product")
+                st.markdown("#### Current vs. Projected Inventory")
+                timeline_sheet, timeline_frame = frame_for(workbook_report, "inventory_timeline") if workbook_report else (None, None)
+                comparison_frame = apply_filters(timeline_frame, filters) if timeline_frame is not None else None
+                actual_periods = inventory_periods(comparison_frame, "Actual") if comparison_frame is not None else pd.DataFrame()
+                forecast_periods = inventory_periods(comparison_frame, "Forecast") if comparison_frame is not None else pd.DataFrame()
+                if timeline_sheet is None or comparison_frame is None or actual_periods.empty or forecast_periods.empty:
+                    st.info("Upload a verified Forecasted Inventory Levels worksheet with ACTUAL and FORECAST periods to compare inventory balances.")
+                else:
+                    latest_actual = actual_periods.iloc[-1]
+                    later_forecasts = forecast_periods[forecast_periods["_sort_key"] > latest_actual["_sort_key"]]
+                    default_forecast = later_forecasts.iloc[0] if not later_forecasts.empty else forecast_periods.iloc[0]
+                    forecast_labels = forecast_periods["label"].tolist()
+                    forecast_widget_key = f"inventory_forecast_week_{getattr(workbook_report, 'content_id', 'workbook')[:12]}"
+                    selected_forecast_label = st.selectbox(
+                        "Forecast Week",
+                        forecast_labels,
+                        index=forecast_labels.index(default_forecast["label"]),
+                        key=forecast_widget_key,
+                    )
+                    selected_forecast = forecast_periods.loc[forecast_periods["label"] == selected_forecast_label].iloc[0]
+                    st.caption(
+                        f"Source worksheet: {timeline_sheet} · Actual {latest_actual['label']} · Forecast {selected_forecast['label']}"
+                    )
+                    group_by = "Individual Product" if len(filters.get("variety", [])) == 1 else "Variety"
+                    render_chart(
+                        lambda: inventory_current_vs_projected(comparison_frame, selected_forecast["key"], group_by),
+                        "executive_overview",
+                        "Current and projected inventory by product or variety",
+                    )
         with mix_col:
             with st.container(key="mix_panel", border=True):
                 st.markdown("#### Inventory Mix")
@@ -977,7 +1121,7 @@ if active_page == "Executive Overview":
                     render_chart(lambda: inventory_mix_donut(filtered), "inventory_mix", "Inventory mix")
                 with mix_legend_col:
                     render_inventory_mix_legend(filtered)
-        st.download_button("Download filtered inventory summary (CSV)", data=filtered.to_csv(index=False).encode("utf-8"), file_name="inventory_summary.csv", mime="text/csv")
+        st.download_button("Export Inventory Data", data=filtered.to_csv(index=False).encode("utf-8"), file_name="inventory_summary.csv", mime="text/csv")
 
 if active_page == "Inventory Timeline":
     st.subheader("Inventory timeline")
@@ -1098,8 +1242,6 @@ LOGGER.info(
     len(st.session_state.get("chart_timings", {})),
 )
 
-if st.session_state.get("chart_timings"):
+if SHOW_PERFORMANCE_UI and st.session_state.get("chart_timings"):
     with st.expander("Dashboard render timings"):
         st.dataframe(pd.DataFrame([{"Chart": label, "Elapsed ms": round(value, 1)} for label, value in st.session_state["chart_timings"].items()]), width="stretch", hide_index=True)
-
-st.caption("The dashboard visualizes supplied workbook values. It does not calculate forecasts, recommend purchases, optimize profit, or make X-blocking decisions.")

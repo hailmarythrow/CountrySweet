@@ -1,6 +1,7 @@
 """Small reusable UI components for source attribution and quality messaging."""
 from __future__ import annotations
 
+import html
 import logging
 from time import perf_counter
 
@@ -27,17 +28,54 @@ def render_quality_alerts(warnings: list[str]) -> None:
         st.warning(f"Data quality review: {len(warnings)} issue(s) detected. Expand the details panel below.", icon="⚠️")
 
 
+def render_upload_success(filename: str, record_count: int, *, source_type: str = "upload") -> None:
+    """Keep a durable, prominent confirmation above the worksheet selector."""
+    heading = "Excel workbook uploaded successfully!" if source_type == "upload" else "Excel workbook loaded successfully!"
+    st.markdown(
+        "<div class='cs-upload-feedback cs-upload-feedback--success'>"
+        "<div class='cs-upload-feedback-icon' aria-hidden='true'>✓</div>"
+        "<div class='cs-upload-feedback-copy'>"
+        f"<div class='cs-upload-feedback-title'>{heading}</div>"
+        f"<div class='cs-upload-feedback-message'>We've received your Excel workbook and loaded <strong>{record_count:,} inventory records</strong>. Your dashboard is ready to explore.</div>"
+        f"<div class='cs-upload-feedback-file'>File: <strong>{html.escape(filename)}</strong></div>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_upload_error(message: str, *, filename: str | None = None, retained_previous: bool = False) -> None:
+    """Show a durable upload error without implying that the file was accepted."""
+    file_suffix = f" File: <strong>{html.escape(filename)}</strong>." if filename else ""
+    retained_suffix = " The previous successfully loaded data remains active." if retained_previous else ""
+    st.markdown(
+        "<div class='cs-upload-feedback cs-upload-feedback--error'>"
+        "<div class='cs-upload-feedback-icon' aria-hidden='true'>!</div>"
+        "<div class='cs-upload-feedback-copy'>"
+        "<div class='cs-upload-feedback-title'>Excel workbook upload failed</div>"
+        f"<div class='cs-upload-feedback-message'>{html.escape(message)}{file_suffix}{html.escape(retained_suffix)}</div>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_quality_summary(report: WorkbookReport) -> None:
     """Render one compact quality summary with expandable source details."""
     formula_warnings = [warning for warning in report.warnings if "formula error" in warning.lower() or "cached value" in warning.lower()]
     review_warnings = [warning for warning in report.warnings if warning not in formula_warnings]
     critical = sum(item.formula_errors for item in report.sheet_reports.values())
     missing_cached = sum(item.missing_formula_results for item in report.sheet_reports.values())
-    st.warning(
-        f"Data quality: {critical} formula error(s), {missing_cached} missing cached result(s), and {len(review_warnings)} review warning(s). Expand details for worksheets and cells.",
-        icon="⚠️",
-    )
-    with st.expander("Data-quality details"):
+    if critical or missing_cached or review_warnings:
+        cached_text = f" and {missing_cached} missing cached result(s)" if missing_cached else ""
+        st.markdown(
+            "<div class='cs-upload-feedback cs-upload-feedback--quality'>"
+            "<div class='cs-upload-feedback-icon' aria-hidden='true'>!</div>"
+            "<div class='cs-upload-feedback-copy'>"
+            "<div class='cs-upload-feedback-title'>Your workbook was uploaded, but we found some items to review.</div>"
+            f"<div class='cs-upload-feedback-message'>We successfully loaded your workbook and detected <strong>{critical} formula error(s)</strong>{cached_text} and <strong>{len(review_warnings)} review warning(s)</strong>. You can continue exploring the loaded data, but some affected calculations may need verification.</div>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+    with st.expander("View data-quality details"):
         if report.warnings:
             for warning in report.warnings:
                 st.caption(f"• {warning}")

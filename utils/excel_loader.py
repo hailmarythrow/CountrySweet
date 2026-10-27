@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 
 
 LOGGER = logging.getLogger("country_sweet.excel")
-REPORT_SCHEMA_VERSION = "sheet-report-source-views-v2"
+REPORT_SCHEMA_VERSION = "sheet-report-source-views-v5"
 
 CANONICAL_COLUMNS = [
     "product", "variety", "classification", "size", "packaging_type", "units",
@@ -179,6 +179,46 @@ def _formula_quality_bounded(formula_ws: Any, cached_ws: Any, bounds: tuple[int,
 
 _SIZE_PATTERNS = ("10-12 oz", "10-12oz", "#1 Jewel", "Medium", "Jumbo", "14oz", "Baby", "Small", "#1")
 
+_DISPLAY_VARIETIES = {
+    "covington": "Covington",
+    "garnet": "Garnet",
+    "japanese": "Japanese",
+    "o'henry": "O'Henry",
+}
+
+
+def _recognized_description_variety(description: object) -> str | None:
+    """Return a canonical customer-facing variety when the description names one.
+
+    Product lookup labels are internal identifiers and can disagree with the
+    customer-facing description (for example, Diane/Vermillion rows described
+    as Garnet). Only one of the explicitly recognized varieties is accepted;
+    ambiguous descriptions remain unmapped rather than being guessed.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return None
+    clean = description.replace("’", "'").strip()
+    matches = [
+        display
+        for normalized, display in _DISPLAY_VARIETIES.items()
+        if re.search(
+            rf"(?<![A-Za-z]){re.escape(normalized)}(?![A-Za-z])",
+            clean.casefold(),
+        )
+    ]
+    unique_matches = list(dict.fromkeys(matches))
+    return unique_matches[0] if len(unique_matches) == 1 else None
+
+
+def _canonical_variety(value: object) -> str | None:
+    """Canonicalize an already-known variety without inventing new categories."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    clean = str(value).replace("’", "'").strip()
+    if not clean:
+        return None
+    return _DISPLAY_VARIETIES.get(clean.casefold())
+
 
 def _split_product_label(label: str, classification: str | None) -> tuple[str, str | None, str | None]:
     clean = str(label).strip()
@@ -190,6 +230,26 @@ def _split_product_label(label: str, classification: str | None) -> tuple[str, s
             variety = base[: -len(suffix)].strip()
             return clean, variety or None, suffix
     return clean, base or None, None
+
+
+def _split_description_fallback(label: str, classification: str | None) -> tuple[str, str | None, str | None, str | None]:
+    """Extract reliable fields from a description when the lookup is blank.
+
+    Forecasted Inventory Levels occasionally leaves column F blank while column
+    G contains a descriptive product string such as ``... Conv. Japanese ...
+    10-12oz``. Only an explicit Conv./Org. marker is used to infer the variety;
+    otherwise the row remains unmapped rather than being guessed.
+    """
+    clean = str(label).strip()
+    marker = re.search(r"\b(Conv\.|Org\.)\s+([A-Za-z][A-Za-z'’-]*)", clean, flags=re.IGNORECASE)
+    size = next((suffix for suffix in _SIZE_PATTERNS if clean.lower().endswith(suffix.lower())), None)
+    if not marker:
+        return clean, None, size, classification
+    marker_classification = "Conventional" if marker.group(1).casefold().startswith("conv") else "Organic"
+    variety = marker.group(2).strip()
+    if size and variety.lower().endswith(size.lower()):
+        variety = variety[: -len(size)].strip()
+    return clean, variety or None, size, classification or marker_classification
 
 
 def _parse_forecasted_inventory(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -212,17 +272,35 @@ def _parse_forecasted_inventory(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFra
             continue
         if first in (None, "Lookups", "Total") and not (isinstance(description, str) and description.startswith(("CSP", "Sweet Potatoes"))):
             continue
+        lookup_blank = first is None or (isinstance(first, str) and not first.strip())
         product_label = str(first or description or "").strip()
         if not product_label or product_label in {"Bulk Variety/Size", "Total"}:
             continue
+        row_classification = classification
         product, variety, size = _split_product_label(product_label, classification)
+        description_source = description if lookup_blank and isinstance(description, str) else product_label
+        if isinstance(description_source, str) and re.search(r"\b(?:Conv\.|Org\.)\s+", description_source, flags=re.IGNORECASE):
+            _, fallback_variety, fallback_size, fallback_classification = _split_description_fallback(description_source, classification)
+            if fallback_variety:
+                variety, size, row_classification = fallback_variety, fallback_size, fallback_classification
+        described_variety = _recognized_description_variety(description)
+        if described_variety:
+            # The worksheet description is the authoritative customer-facing
+            # variety when it explicitly names one, even if column F uses an
+            # internal lookup label such as Diane or Vermillion.
+            variety = described_variety
+        else:
+            # Keep only recognized lookup varieties. Any unresolved lookup or
+            # description is retained as an unmapped row instead of creating a
+            # misleading chart category from an internal identifier.
+            variety = _canonical_variety(variety)
         for index in timeline_columns:
             value = row[index] if index < len(row) else None
             if value is None:
                 continue
             report_date = date_row[index]
             output.append({
-                "product": product, "variety": variety, "classification": classification, "size": size,
+                "product": product, "variety": variety, "classification": row_classification, "size": size,
                 "packaging_type": "Bulk Bin", "units": "lbs", "stored_lbs": value,
                 "forecast_demand_lbs": pd.NA, "planned_sales_lbs": pd.NA, "starting_inventory_lbs": pd.NA,
                 "contribution_margin": pd.NA, "upcoming_demand_lbs": pd.NA,
