@@ -33,7 +33,9 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     if header_image_path and header_image_path.exists():
         encoded = base64.b64encode(header_image_path.read_bytes()).decode("ascii")
         header_image = f"url(data:image/png;base64,{encoded})"
-    header_background = f"linear-gradient(90deg, rgba(5,15,26,.97) 0%, rgba(5,15,26,.86) 42%, rgba(5,15,26,.58) 72%, rgba(5,15,26,.42) 100%), {header_image}" if header_image else "linear-gradient(120deg, #0B1622 0%, #192B3A 100%)"
+    # Keep the same navy overlay and image crop, but let more of the harvest
+    # photograph show through for better visibility in the hero.
+    header_background = f"linear-gradient(90deg, rgba(5,15,26,.82) 0%, rgba(5,15,26,.71) 42%, rgba(5,15,26,.48) 72%, rgba(5,15,26,.35) 100%), {header_image}" if header_image else "linear-gradient(120deg, #0B1622 0%, #192B3A 100%)"
     st.markdown(f"""<style>
     :root {{
         --cs-background: {colors['background']}; --cs-sidebar: {colors['sidebar']};
@@ -157,11 +159,80 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div.st-key-upload_panel [data-testid="stFileUploaderFileData"] {{ color: var(--cs-text); }}
     div.st-key-upload_panel [data-testid="stCaptionContainer"] {{ margin: .55rem 0 0; color: var(--cs-muted); font-size: .72rem; line-height: 1.25; }}
     div.st-key-filters_panel {{ background: var(--cs-panel); border: 1px solid var(--cs-border); border-radius: .7rem; padding: .65rem .75rem .35rem; margin: .55rem 0 .7rem; }}
-    div.st-key-filters_panel h4 {{ margin: 0 0 .08rem; }}
+    div.st-key-filters_panel .cs-filter-heading {{ display: flex; align-items: center; gap: 12px; min-height: 2.1rem; margin: 0 0 .55rem; }}
+    div.st-key-filters_panel .cs-filter-heading-title {{ color: #FFFFFF; font-size: 26px; line-height: 1.15; font-weight: 700; white-space: nowrap; }}
+    div.st-key-filters_panel .cs-filter-heading-icon {{ display: inline-flex; align-items: center; color: #F59A3D; width: 32px; height: 32px; flex: 0 0 32px; }}
+    div.st-key-filters_panel .cs-filter-heading-icon .cs-inline-icon {{ width: 32px; height: 32px; }}
+    div.st-key-filters_panel .cs-filter-heading-help {{ color: var(--cs-muted); font-size: .78rem; font-weight: 400; }}
+    div.st-key-filters_panel .cs-filter-control-label {{ display: flex; align-items: center; gap: .32rem; color: var(--cs-heading); font-size: .78rem; font-weight: 600; line-height: 1.2; min-height: 1.15rem; margin: 0 0 .2rem; }}
+    div.st-key-filters_panel .cs-filter-control-label .cs-inline-icon {{ color: var(--cs-muted); flex: 0 0 auto; }}
+    div.st-key-filters_panel .cs-filter-control-label strong {{ font-weight: 700; }}
+    div.st-key-filters_panel [data-testid="stHorizontalBlock"] {{ gap: .55rem; }}
+    div.st-key-filters_panel [data-testid="stHorizontalBlock"]:has(.cs-filter-control-label) {{ align-items: end !important; }}
+    div.st-key-filters_panel [data-testid="stHorizontalBlock"]:has(.cs-filter-control-label) {{ gap: .8rem; }}
+    div.st-key-filters_panel [data-testid="stVerticalBlock"]:has(> div.st-key-filter_tile_year),
+    div.st-key-filters_panel [data-testid="stVerticalBlock"]:has(> div.st-key-filter_tile_week),
+    div.st-key-filters_panel [data-testid="stVerticalBlock"]:has(> div.st-key-filter_tile_variety),
+    div.st-key-filters_panel [data-testid="stVerticalBlock"]:has(> div.st-key-filter_tile_classification),
+    div.st-key-filters_panel [data-testid="stVerticalBlock"]:has(> div.st-key-filter_tile_size) {{ min-height: 112px; height: 100%; box-sizing: border-box; }}
+    div.st-key-filter_tile_year, div.st-key-filter_tile_week, div.st-key-filter_tile_variety,
+    div.st-key-filter_tile_classification, div.st-key-filter_tile_size {{
+        min-height: 112px; height: 100%; box-sizing: border-box; padding: 12px;
+        background: rgba(12, 24, 36, .72); border: 1px solid var(--cs-border); border-radius: 10px;
+    }}
+    div.st-key-filter_tile_year {{ border-color: #F59A3D; }}
+    div.st-key-filter_tile_week {{ border-color: #AA82F4; }}
+    div.st-key-filter_tile_variety {{ border-color: #39C982; }}
+    div.st-key-filter_tile_classification {{ border-color: #39C982; }}
+    div.st-key-filter_tile_size {{ border-color: #38BDF8; }}
+    div.st-key-filter_tile_year .cs-filter-control-label, div.st-key-filter_tile_week .cs-filter-control-label,
+    div.st-key-filter_tile_variety .cs-filter-control-label, div.st-key-filter_tile_classification .cs-filter-control-label,
+    div.st-key-filter_tile_size .cs-filter-control-label {{ min-height: 30px; margin: 0 0 8px; font-size: 15px; font-weight: 600; gap: 8px; }}
+    div.st-key-filter_tile_year .cs-filter-control-label .cs-inline-icon {{ color: #F59A3D; }}
+    div.st-key-filter_tile_week .cs-filter-control-label .cs-inline-icon {{ color: #AA82F4; }}
+    div.st-key-filter_tile_variety .cs-filter-control-label .cs-inline-icon, div.st-key-filter_tile_classification .cs-filter-control-label .cs-inline-icon {{ color: #39C982; }}
+    div.st-key-filter_tile_size .cs-filter-control-label .cs-inline-icon {{ color: #38BDF8; }}
+    div.st-key-filter_tile_year .cs-filter-control-label .cs-inline-icon, div.st-key-filter_tile_week .cs-filter-control-label .cs-inline-icon,
+    div.st-key-filter_tile_variety .cs-filter-control-label .cs-inline-icon, div.st-key-filter_tile_classification .cs-filter-control-label .cs-inline-icon,
+    div.st-key-filter_tile_size .cs-filter-control-label .cs-inline-icon {{ width: 26px; height: 26px; }}
+    div.st-key-filter_tile_year [data-baseweb="select"] > div, div.st-key-filter_tile_week [data-baseweb="select"] > div,
+    div.st-key-filter_tile_variety [data-baseweb="select"] > div, div.st-key-filter_tile_size [data-baseweb="select"] > div {{ min-height: 38px; }}
+    div.st-key-filter_tile_year [data-baseweb="select"] span, div.st-key-filter_tile_week [data-baseweb="select"] span,
+    div.st-key-filter_tile_variety [data-baseweb="select"] span, div.st-key-filter_tile_size [data-baseweb="select"] span,
+    div.st-key-filter_tile_year [data-baseweb="select"] input, div.st-key-filter_tile_week [data-baseweb="select"] input,
+    div.st-key-filter_tile_variety [data-baseweb="select"] input, div.st-key-filter_tile_size [data-baseweb="select"] input {{
+        color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important; font-size: 14px !important;
+    }}
+    div.st-key-filter_tile_year [data-testid="stMultiSelectTagsContainer"],
+    div.st-key-filter_tile_week [data-testid="stMultiSelectTagsContainer"],
+    div.st-key-filter_tile_variety [data-testid="stMultiSelectTagsContainer"],
+    div.st-key-filter_tile_size [data-testid="stMultiSelectTagsContainer"],
+    div.st-key-filter_tile_year [data-testid="stMultiSelectTagsContainer"] *,
+    div.st-key-filter_tile_week [data-testid="stMultiSelectTagsContainer"] *,
+    div.st-key-filter_tile_variety [data-testid="stMultiSelectTagsContainer"] *,
+    div.st-key-filter_tile_size [data-testid="stMultiSelectTagsContainer"] * {{
+        color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important; opacity: 1 !important;
+    }}
+    body:has(div.st-key-filters_panel) [role="option"],
+    body:has(div.st-key-filters_panel) [role="option"] * {{
+        color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important;
+    }}
+    div.st-key-filter_tile_classification [data-testid="stButtonGroup"] {{ width: 100%; display: flex !important; flex-wrap: nowrap !important; }}
+    div.st-key-filter_tile_classification [data-testid="stButtonGroup"] [role="radio"] {{
+        min-height: 38px; background: #0D1B2A !important; color: var(--cs-text) !important;
+        border-color: var(--cs-border) !important; font-size: 14px; font-weight: 500;
+        flex: 1 1 auto !important; min-width: max-content !important; white-space: nowrap !important;
+        padding-left: 5px !important; padding-right: 5px !important;
+    }}
+    div.st-key-filter_tile_classification [data-testid="stButtonGroup"] [role="radio"][aria-checked="true"] {{
+        background: #168A58 !important; color: #FFFFFF !important; border-color: #168A58 !important; font-weight: 700;
+    }}
+    div.st-key-filter_tile_classification [data-testid="stButtonGroup"] [role="radio"]:focus-visible {{ outline: 2px solid #8EE8B5 !important; outline-offset: 2px; }}
     div.st-key-filters_panel [data-testid="stCaptionContainer"] {{ margin: 0 0 .15rem; line-height: 1.2; }}
     div.st-key-filters_panel [data-testid="stWidgetLabel"] {{ margin-bottom: .12rem; }}
     div.st-key-filters_panel div[data-baseweb="select"] > div {{ min-height: 2rem; }}
-    div.st-key-filters_panel [data-testid="stHorizontalBlock"] {{ gap: .55rem; }}
+    div.st-key-filters_panel [data-testid="stButtonGroup"] {{ width: 100%; }}
+    div.st-key-filters_panel [data-testid="stButtonGroup"] button {{ min-height: 2rem; white-space: nowrap; }}
     div.st-key-inventory_panel {{ background: var(--cs-panel); border: 1px solid var(--cs-border); border-radius: .7rem; padding: .55rem .65rem .25rem; min-height: 23rem; }}
     div.st-key-mix_panel {{ background: var(--cs-panel); border: 1px solid var(--cs-border); border-radius: .7rem; padding: .55rem .65rem 25.8px; min-height: 0; }}
     div.st-key-inventory_panel h4 {{ margin: 0 0 .2rem; }}
@@ -190,8 +261,9 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div.st-key-hero_header h3 {{ color: var(--cs-heading) !important; font-size: clamp(1.7rem, 3vw, 2.35rem); margin: .05rem 0 .2rem; }}
     div.st-key-hero_header [data-testid="stCaptionContainer"] {{ color: var(--cs-muted); margin: 0; line-height: 1.25; }}
     div.st-key-header_copy {{ row-gap: 12px !important; justify-content: flex-start !important; }}
+    div.st-key-header_copy #cs-live-clock-shell {{ height: 19px !important; }}
     div.st-key-header_copy [data-testid="stCaptionContainer"] {{ margin: 0 !important; }}
-    div.st-key-header_copy h3 {{ margin: 0 0 14px !important; }}
+    div.st-key-header_copy h3 {{ margin: 0 0 9px !important; }}
     div.st-key-header_copy [data-testid="stMarkdownContainer"] p {{ margin: 0 !important; }}
     div.st-key-hero_header {{
         position: relative; isolation: isolate; background: #07111B;

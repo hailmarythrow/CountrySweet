@@ -166,13 +166,31 @@ def inventory_current_vs_projected(
     if chart_data.empty:
         return None
 
+    def compact_pounds(value: object) -> str:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric):
+            return ""
+        numeric = float(numeric)
+        magnitude = abs(numeric)
+        if magnitude >= 1_000_000:
+            return f"{numeric / 1_000_000:.1f}M"
+        if magnitude >= 1_000:
+            return f"{numeric / 1_000:.1f}K"
+        return f"{numeric:,.0f}"
+
+    # Keep labels readable for the compact variety view. Detailed product
+    # views can contain many rows, so their full values remain available in
+    # hover without forcing overlapping labels above every column.
+    show_value_labels = summary["product_label"].nunique() <= 8
+    chart_data["display_value"] = chart_data["pounds"].map(compact_pounds) if show_value_labels else ""
+
     fig = px.bar(
         chart_data,
-        x="pounds",
-        y="product_label",
+        x="product_label",
+        y="pounds",
         color="measure",
-        orientation="h",
         barmode="group",
+        text="display_value",
         custom_data=["product_label", "actual_week", "actual_lbs", "forecast_week", "projected_lbs", "net_change_lbs"],
         labels={"product_label": "Variety" if grouped_by_variety else "Product", "pounds": "Pounds", "measure": ""},
         color_discrete_map={"Actual Inventory": "#32936B", "Projected Inventory": "#F47C35"},
@@ -191,19 +209,39 @@ def inventory_current_vs_projected(
     )
     for trace in fig.data:
         trace.hovertemplate = actual_hover if trace.name == "Actual Inventory" else projected_hover
-    # Plotly renders the first horizontal grouped trace below the second. Keep
-    # the legend ranked Actual → Projected while placing Actual above Projected.
-    fig.data = tuple(sorted(fig.data, key=lambda trace: 0 if trace.name == "Projected Inventory" else 1))
+    # Keep the legend and grouped columns ordered consistently.
+    fig.data = tuple(sorted(fig.data, key=lambda trace: 0 if trace.name == "Actual Inventory" else 1))
     for trace in fig.data:
         trace.legendrank = 1 if trace.name == "Actual Inventory" else 2
+        trace.textposition = "outside"
+        trace.cliponaxis = False
+        trace.textfont = dict(size=11)
     fig.update_layout(
-        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0),
-        margin=dict(l=210, r=30, t=100, b=70),
-        height=max(400, min(720, chart_data["product_label"].nunique() * 55 + 140)),
-        bargap=0.24,
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5),
+        margin=dict(l=65, r=30, t=100, b=80),
+        height=max(420, min(720, chart_data["product_label"].nunique() * 55 + 150)),
+        bargap=0.32,
+        bargroupgap=0.08,
+        uniformtext_minsize=9,
+        uniformtext_mode="hide",
     )
-    fig.update_yaxes(automargin=True, categoryorder="array", categoryarray=summary["product_label"].tolist(), tickfont=dict(size=12))
-    fig.update_xaxes(automargin=True, zeroline=True, zerolinecolor="#718096", zerolinewidth=1)
+    fig.update_xaxes(
+        automargin=True,
+        categoryorder="array",
+        categoryarray=summary["product_label"].tolist(),
+        title="Variety" if grouped_by_variety else "Product",
+        tickfont=dict(size=12),
+        tickangle=0,
+        showgrid=False,
+    )
+    fig.update_yaxes(
+        automargin=True,
+        title="Pounds",
+        zeroline=True,
+        zerolinecolor="#718096",
+        zerolinewidth=1,
+        rangemode="tozero",
+    )
     return fig
 
 

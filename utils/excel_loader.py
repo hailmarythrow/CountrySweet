@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 
 
 LOGGER = logging.getLogger("country_sweet.excel")
-REPORT_SCHEMA_VERSION = "sheet-report-source-views-v5"
+REPORT_SCHEMA_VERSION = "sheet-report-source-views-v6-variety-normalization"
 
 CANONICAL_COLUMNS = [
     "product", "variety", "classification", "size", "packaging_type", "units",
@@ -124,6 +124,8 @@ def normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
     for field_name in ["product", "variety", "classification", "size", "packaging_type", "units", "inventory_state"]:
         if field_name in result:
             result[field_name] = result[field_name].where(result[field_name].notna(), pd.NA).astype("string").str.strip()
+    if "variety" in result:
+        result["variety"] = result["variety"].map(_canonical_variety).astype("string")
     if "classification" in result:
         result["classification"] = result["classification"].str.title()
     for field_name in [
@@ -186,6 +188,12 @@ _DISPLAY_VARIETIES = {
     "o'henry": "O'Henry",
 }
 
+_INTERNAL_VARIETY_ALIASES = {
+    "bellevue": "Covington",
+    "diane": "Garnet",
+    "vermillion": "Garnet",
+}
+
 
 def _recognized_description_variety(description: object) -> str | None:
     """Return a canonical customer-facing variety when the description names one.
@@ -211,13 +219,65 @@ def _recognized_description_variety(description: object) -> str | None:
 
 
 def _canonical_variety(value: object) -> str | None:
-    """Canonicalize an already-known variety without inventing new categories."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    """Canonicalize display spelling while retaining legitimate unknown varieties."""
+    if value is None or pd.isna(value):
         return None
     clean = str(value).replace("’", "'").strip()
     if not clean:
         return None
-    return _DISPLAY_VARIETIES.get(clean.casefold())
+    return _DISPLAY_VARIETIES.get(clean.casefold(), clean)
+
+
+def _verified_variety_aliases(frame: pd.DataFrame) -> dict[str, str]:
+    """Infer internal-to-display aliases only when the workbook supplies evidence.
+
+    Forecast descriptions are parsed into the customer-facing ``variety``
+    field. When a compact product identifier contains an internal name and
+    that same row resolves to a recognized display variety, the relationship
+    is safe to carry to the other worksheet views in this workbook.
+    """
+    candidates: dict[str, set[str]] = {}
+    if frame.empty or not {"product", "variety"}.issubset(frame.columns):
+        return {}
+    for _, row in frame.iterrows():
+        display = _canonical_variety(row.get("variety"))
+        if display not in set(_DISPLAY_VARIETIES.values()):
+            continue
+        product = row.get("product")
+        if product is None or pd.isna(product):
+            continue
+        _, inferred, _ = _split_product_label(str(product), row.get("classification"))
+        alias_key = str(inferred or "").replace("’", "'").strip().casefold()
+        if alias_key in _INTERNAL_VARIETY_ALIASES and alias_key != display.casefold():
+            candidates.setdefault(alias_key, set()).add(display)
+    return {
+        alias: next(iter(values))
+        for alias, values in candidates.items()
+        if len(values) == 1
+    }
+
+
+def _apply_verified_variety_aliases(frames: dict[str, pd.DataFrame], aliases: dict[str, str]) -> int:
+    """Apply workbook-supported aliases in place and return changed row count."""
+    changed = 0
+    if not aliases:
+        return changed
+    for frame in frames.values():
+        if "variety" not in frame:
+            continue
+
+        def normalize(value: object) -> object:
+            nonlocal changed
+            canonical = _canonical_variety(value)
+            key = str(canonical or "").replace("’", "'").strip().casefold()
+            mapped = aliases.get(key)
+            if mapped and mapped != canonical:
+                changed += 1
+                return mapped
+            return canonical
+
+        frame["variety"] = frame["variety"].map(normalize).astype("string")
+    return changed
 
 
 def _split_product_label(label: str, classification: str | None) -> tuple[str, str | None, str | None]:
@@ -677,6 +737,17 @@ def load_inventory_workbook(content: bytes, progress_callback: Callable[[str], N
             cells = ", ".join(formula_quality[4])
             quality_warnings.append(f"{sheet}: {formula_quality[2]} formula result(s) have no cached value at {cells}; they were not treated as zero.")
         LOGGER.info("excel.sheet_parse sheet=%s rows=%d elapsed_ms=%.1f", sheet, len(frame), elapsed_ms)
+
+    # Use the Forecasted Inventory Levels descriptions as the workbook-local
+    # evidence for internal aliases used by Current Week Model and other
+    # views. This preserves unknown varieties for future workbooks rather than
+    # globally assuming that every Diane/Vermillion/Bellevue label means the
+    # same thing.
+    verified_aliases = _verified_variety_aliases(frames.get("Forecasted Inventory Levels", _canonical_empty()))
+    mapped_variety_rows = _apply_verified_variety_aliases(frames, verified_aliases)
+    if verified_aliases:
+        mapping_text = ", ".join(f"{alias.title()} → {display}" for alias, display in sorted(verified_aliases.items()))
+        LOGGER.info("excel.variety_normalization aliases=%s changed_rows=%d", mapping_text, mapped_variety_rows)
 
     harvest_parts = [frames[sheet] for sheet in ("Forecast Harvest by Week HC", "Sales by Week", "Packout %") if sheet in frames and not frames[sheet].empty]
     if harvest_parts:

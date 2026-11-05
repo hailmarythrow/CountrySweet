@@ -33,6 +33,7 @@ from utils.ui import render_chart, render_quality_summary, render_upload_error, 
 from utils.validation import apply_filters, options, source_period
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "Country_Sweet_Produce_Logo_HD.png"
+SIDEBAR_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "bakosweet.png"
 HEADER_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "backdrop.png"
 LOGGER = logging.getLogger("country_sweet.dashboard")
 LOGGER.setLevel(logging.INFO)
@@ -75,6 +76,16 @@ SHOW_DATA_QUALITY_UI = False
 # Keep chart timing collection active, but hide the technical timing table
 # from the everyday dashboard interface.
 SHOW_PERFORMANCE_UI = False
+# Keep worksheet validation reports available internally, but hide the
+# technical diagnostics dataframe from the user-facing Inventory Explorer.
+SHOW_DATA_EXPLORER_DIAGNOSTICS = False
+# Purchasing and Loads charts are temporarily hidden while the business
+# meaning and validity of the POs and Loads per Week worksheets are confirmed.
+# The chart functions and parsed source data remain available for restoration.
+SHOW_PURCHASING_LOAD_CHARTS = False
+# Keep the Purchasing & Loads parsers and page implementation available, but
+# temporarily remove the page from the employee-facing navigation.
+SHOW_PURCHASING_LOADS = False
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -123,6 +134,260 @@ def clean_data(frame: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("The file has no data rows.")
     return df
+
+
+def _explorer_text(value: object) -> str:
+    """Return a safe, display-ready value for Inventory Explorer suggestions."""
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def inventory_explorer_suggestions(frame: pd.DataFrame, query: str, limit: int = 6) -> list[dict[str, object]]:
+    """Build workbook-backed autocomplete suggestions from an already filtered frame.
+
+    This operates only on the in-memory records already used by the Explorer;
+    it never reparses the workbook. Classification-wide suggestions are kept
+    separate from product-level suggestions so the selected scope is explicit.
+    """
+    search = str(query or "").strip().casefold()
+    if not search or frame is None or frame.empty:
+        return []
+
+    candidates: list[dict[str, object]] = []
+    classifications = sorted(
+        {
+            _explorer_text(value)
+            for value in frame.get("classification", pd.Series(dtype="object")).dropna().tolist()
+            if _explorer_text(value)
+        },
+        key=str.casefold,
+    )
+    for classification in classifications:
+        if search not in classification.casefold():
+            continue
+        candidates.append(
+            {
+                "label": f"{classification} — All products",
+                "kind": "classification",
+                "classification": classification,
+                "score": 0 if classification.casefold().startswith(search) else 8,
+            }
+        )
+
+    product_groups: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    for _, row in frame.iterrows():
+        product = _explorer_text(row.get("product"))
+        variety = _explorer_text(row.get("variety"))
+        classification = _explorer_text(row.get("classification"))
+        size = _explorer_text(row.get("size"))
+        searchable = " ".join(value for value in (product, variety, classification, size) if value)
+        if not searchable or search not in searchable.casefold():
+            continue
+        key = (product.casefold(), variety.casefold(), classification.casefold(), size.casefold())
+        product_groups.setdefault(
+            key,
+            {
+                "product": product,
+                "variety": variety,
+                "classification": classification,
+                "size": size,
+            },
+        )
+
+    labels_seen = {str(item["label"]) for item in candidates}
+    for item in product_groups.values():
+        classification = str(item["classification"])
+        variety = str(item["variety"])
+        size = str(item["size"])
+        product = str(item["product"])
+        readable_parts = [part for part in (classification, variety) if part]
+        if size:
+            readable_parts.append(size)
+        label = " · ".join(readable_parts) if readable_parts else product
+        if label in labels_seen:
+            label = f"{label} · {product}" if product else label
+        labels_seen.add(label)
+        searchable_values = [product, variety, classification, size]
+        starts_with = any(value.casefold().startswith(search) for value in searchable_values if value)
+        candidates.append(
+            {
+                "label": label,
+                "kind": "product",
+                "product": product,
+                "variety": variety,
+                "classification": classification,
+                "size": size,
+                "score": 2 if starts_with else 12,
+            }
+        )
+
+    candidates.sort(key=lambda item: (int(item.get("score", 99)), str(item["label"]).casefold()))
+    return candidates[: max(1, int(limit))]
+
+
+def filter_inventory_explorer_suggestion(frame: pd.DataFrame, suggestion: dict[str, object]) -> pd.DataFrame:
+    """Apply one selected autocomplete scope without changing global filters."""
+    result = frame.copy()
+    if result.empty:
+        return result
+    if suggestion.get("kind") == "classification":
+        value = str(suggestion.get("classification", "")).casefold()
+        return result[result["classification"].map(_explorer_text).str.casefold() == value]
+    for column in ("product", "variety", "classification", "size"):
+        expected = _explorer_text(suggestion.get(column))
+        if expected and column in result:
+            result = result[result[column].map(_explorer_text).str.casefold() == expected.casefold()]
+    return result
+
+
+def clear_inventory_explorer_selection() -> None:
+    """Clear a prior suggestion when the search query changes."""
+    st.session_state["inventory_explorer_suggestion"] = None
+
+
+_INVENTORY_EXPLORER_AUTOCOMPLETE_HTML = """
+<div class="cs-explorer-autocomplete">
+  <label for="cs-explorer-search">Search verified records</label>
+  <input id="cs-explorer-search" type="search" autocomplete="off"
+         placeholder="Product, variety, classification, or size" />
+  <div id="cs-explorer-suggestions" role="listbox" aria-label="Matching products"></div>
+</div>
+"""
+
+_INVENTORY_EXPLORER_AUTOCOMPLETE_CSS = """
+.cs-explorer-autocomplete { width: 100%; font-family: inherit; }
+.cs-explorer-autocomplete label { display: block; color: var(--cs-text, #F5F7FA); font-size: .875rem; margin: 0 0 .35rem; }
+.cs-explorer-autocomplete input { width: 100%; box-sizing: border-box; color: var(--cs-text, #F5F7FA); background: var(--cs-input, #1A3044); border: 1px solid var(--cs-border, #2C4558); border-radius: .45rem; padding: .55rem .7rem; font: inherit; outline: none; }
+.cs-explorer-autocomplete input:focus { border-color: var(--cs-accent, #F47C35); box-shadow: 0 0 0 1px var(--cs-accent, #F47C35); }
+#cs-explorer-suggestions { display: grid; gap: .25rem; margin-top: .35rem; }
+#cs-explorer-suggestions button { width: 100%; display: flex; align-items: center; gap: .55rem; text-align: left; color: var(--cs-text, #F5F7FA); background: var(--cs-card, #13283A); border: 1px solid var(--cs-border, #2C4558); border-radius: .4rem; padding: .45rem .6rem; font: inherit; cursor: pointer; }
+#cs-explorer-suggestions button:hover, #cs-explorer-suggestions button[aria-selected="true"] { color: var(--cs-heading, #F9FAFB); background: var(--cs-hover, #20384B); border-color: var(--cs-accent, #F47C35); }
+#cs-explorer-suggestions button .kind { color: var(--cs-accent, #F47C35); font-size: .72rem; font-weight: 700; letter-spacing: .02em; text-transform: uppercase; flex: 0 0 auto; }
+#cs-explorer-suggestions .no-matches { color: var(--cs-muted, #BAC9D7); font-size: .82rem; padding: .35rem 0; }
+#cs-explorer-suggestions[hidden] { display: none !important; }
+"""
+
+_INVENTORY_EXPLORER_AUTOCOMPLETE_JS = """
+export default function(component) {
+  const { data, parentElement, setStateValue, setTriggerValue } = component;
+  const input = parentElement.querySelector('#cs-explorer-search');
+  const list = parentElement.querySelector('#cs-explorer-suggestions');
+  if (!input || !list) return;
+
+  const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+  let activeIndex = -1;
+  let isOpen = Boolean(data?.open && String(data?.query ?? '').trim());
+  input.value = data?.query ?? '';
+
+  const close = (persist = true) => {
+    isOpen = false;
+    activeIndex = -1;
+    list.replaceChildren();
+    list.hidden = true;
+    if (persist) setStateValue('open', false);
+  };
+
+  const choose = (item) => {
+    input.value = item.label ?? '';
+    close(false);
+    setStateValue('open', false);
+    setStateValue('query', data?.query ?? '');
+    setTriggerValue('selected', item.id);
+  };
+
+  const render = () => {
+    list.replaceChildren();
+    list.hidden = !isOpen;
+    if (!isOpen) return;
+    if (data?.no_matches) {
+      const empty = document.createElement('div');
+      empty.className = 'no-matches';
+      empty.textContent = 'No matching products';
+      list.appendChild(empty);
+      return;
+    }
+    suggestions.forEach((item, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'option');
+      button.setAttribute('aria-selected', String(index === activeIndex));
+      const kind = document.createElement('span');
+      kind.className = 'kind';
+      kind.textContent = item.kind === 'classification' ? 'All products' : 'Product';
+      const label = document.createElement('span');
+      label.textContent = item.label ?? '';
+      button.append(kind, label);
+      button.onclick = () => choose(item);
+      list.appendChild(button);
+    });
+  };
+
+  input.oninput = () => {
+    isOpen = Boolean(input.value.trim());
+    setStateValue('open', isOpen);
+    setStateValue('query', input.value);
+  };
+  input.onfocus = () => {
+    if (input.value.trim()) {
+      isOpen = true;
+      setStateValue('open', true);
+      render();
+    }
+  };
+  input.onblur = () => {
+    window.setTimeout(() => {
+      if (!parentElement.contains(document.activeElement)) close();
+    }, 0);
+  };
+  list.onmousedown = (event) => {
+    if (event.target.closest('button')) event.preventDefault();
+  };
+  input.onkeydown = (event) => {
+    if (!suggestions.length) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, suggestions.length - 1);
+      render();
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      render();
+    } else if (event.key === 'Enter' && activeIndex >= 0) {
+      event.preventDefault();
+      choose(suggestions[activeIndex]);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    }
+  };
+  render();
+
+  const handleDocumentPointerDown = (event) => {
+    if (!parentElement.contains(event.target)) close();
+  };
+  document.addEventListener('pointerdown', handleDocumentPointerDown);
+  return () => document.removeEventListener('pointerdown', handleDocumentPointerDown);
+}
+"""
+
+try:
+    _inventory_explorer_autocomplete = st.components.v2.component(
+        "inventory_explorer_autocomplete",
+        html=_INVENTORY_EXPLORER_AUTOCOMPLETE_HTML,
+        css=_INVENTORY_EXPLORER_AUTOCOMPLETE_CSS,
+        js=_INVENTORY_EXPLORER_AUTOCOMPLETE_JS,
+    )
+except AttributeError:
+    _inventory_explorer_autocomplete = None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -236,6 +501,12 @@ def dashboard_icon(name: str, *, size: int = 24) -> str:
         "bars": '<path d="M4 20V10m5 10V4m5 16v-7m5 7V7"/><path d="M2 20h20"/>',
         "scale": '<path d="M12 4v16M7 20h10M5 7h14M5 7l-3 6a3 3 0 0 0 6 0zM19 7l-3 6a3 3 0 0 0 6 0z"/>',
         "file": '<path d="M6 2.8h8l4 4v14.4H6z"/><path d="M14 2.8v4h4M9 12h6m-6 4h6"/>',
+        "filter": '<path d="M3 5h18l-7 8v5l-4 2v-7z"/>',
+        "calendar-days": '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01M16 18h.01"/>',
+        "calendar-range": '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 15h2M14 15h2M8 19h2M14 19h2"/>',
+        "sprout": '<path d="M7 20h10M12 20v-9"/><path d="M12 11c-1.8 0-3.5-.7-4.8-2S5 6 5 4c2 0 3.8.7 5.2 2S12 9 12 11Z"/><path d="M12 11c1.8 0 3.5-.7 4.8-2S19 6 19 4c-2 0-3.8.7-5.2 2S12 9 12 11Z"/>',
+        "layers-2": '<path d="m12.83 2.18 7.5 4.23a1 1 0 0 1 0 1.74l-7.5 4.23a1.75 1.75 0 0 1-1.66 0l-7.5-4.23a1 1 0 0 1 0-1.74l7.5-4.23a1.75 1.75 0 0 1 1.66 0Z"/><path d="m5 12 7 4 7-4M5 17l7 4 7-4"/>',
+        "scaling": '<path d="M21 3 3 21M3 7V3h4M17 3h4v4M21 17v4h-4M7 21H3v-4"/>',
     }
     path = paths.get(name, paths["file"])
     return f'<svg class="cs-inline-icon" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{path}</svg>'
@@ -255,9 +526,9 @@ def render_sidebar_navigation(page_names: list[str]) -> str:
     }
     with st.sidebar:
         with st.container(key="sidebar_branding"):
-            st.image(str(LOGO_PATH), width=135, output_format="PNG")
+            st.image(str(SIDEBAR_LOGO_PATH), width=135, output_format="PNG")
             st.markdown(
-                "<div class='cs-sidebar-company'>Country Sweet Produce</div>"
+                "<div class='cs-sidebar-company'>Bako Sweet</div>"
                 "<div class='cs-sidebar-tagline'>Sweeten Your Everyday</div>",
                 unsafe_allow_html=True,
             )
@@ -293,11 +564,11 @@ def render_kpi_cards(stored: float | None, demand: float | None, balance: float 
     stored_label = f"{stored:,.0f} lbs" if stored is not None else unavailable_label
     demand_label = f"{demand:,.0f} lbs" if demand is not None else unavailable_label
     balance_label = f"{balance:+,.0f} lbs" if balance is not None else unavailable_label
-    balance_support = "Surplus" if balance is not None and balance >= 0 else "Shortage" if balance is not None else "Awaiting verified values"
+    balance_support = "Starting inventory − planned sales" if balance is not None else "Awaiting verified values"
     cards = [
-        ("storage", "warehouse", "Inventory in storage", stored_label, "Verified stored pounds"),
-        ("demand", "bars", "Forecast demand", demand_label, "Workbook demand plan"),
-        ("balance", "scale", "Net balance", balance_label, balance_support),
+        ("storage", "warehouse", "Starting Inventory", stored_label, "Beginning-of-week inventory"),
+        ("demand", "bars", "This Week's Planned Sales", demand_label, "Current week's planned sales"),
+        ("balance", "scale", "Inventory Less Planned Sales", balance_label, balance_support),
     ]
     markup = "<div class='cs-kpi-grid'>"
     for style, icon, label, value, support in cards:
@@ -898,9 +1169,36 @@ filter_keys = {
 if st.session_state.get("filter_signature") != filter_signature:
     for key in filter_keys.values():
         st.session_state[key] = []
+    st.session_state["filter_classification_segment"] = "All"
     st.session_state.filter_signature = filter_signature
 for key in filter_keys.values():
     st.session_state.setdefault(key, [])
+
+
+def sync_classification_filter() -> None:
+    choice = st.session_state.get("filter_classification_segment", "All")
+    st.session_state[filter_keys["classification"]] = [] if choice == "All" else [choice]
+
+
+if "filter_classification_segment" not in st.session_state:
+    existing_classification = st.session_state[filter_keys["classification"]]
+    st.session_state["filter_classification_segment"] = (
+        existing_classification[0] if len(existing_classification) == 1 else "All"
+    )
+
+# Packaging is only useful as a visible filter when the loaded data contains
+# more than one valid option. Keep a hidden/stale selection from affecting
+# results when the control is not rendered.
+packaging_options = options(df, "packaging_type")
+show_packaging_filter = len(packaging_options) >= 2
+if not show_packaging_filter:
+    st.session_state[filter_keys["packaging_type"]] = []
+
+# Product remains part of the canonical filter schema for search and explorer
+# behavior, but the standalone Product dropdown is intentionally removed from
+# the main Filters panel. Clear any value left by an earlier app version so it
+# cannot act as an invisible filter.
+st.session_state[filter_keys["product"]] = []
 
 filters = {
     "year": st.session_state[filter_keys["year"]],
@@ -941,7 +1239,44 @@ else:
 balance = stored - demand if stored is not None and demand is not None else None
 no_matching_records = bool(df is not None and not df.empty and filtered.empty)
 missing_metric_label = "No matching records" if no_matching_records else ("Not available from selected worksheet" if workbook_report else "Unavailable")
-render_kpi_cards(stored, demand, balance, missing_metric_label)
+
+# Resolve the selected page before rendering shared page content so Settings
+# can omit the KPI row during the same Streamlit run as its navigation click.
+harvest_view_available = bool(workbook_report and frame_for(workbook_report, "harvest_sales")[1] is not None and not frame_for(workbook_report, "harvest_sales")[1].empty)
+purchasing_view_available = bool(
+    SHOW_PURCHASING_LOADS
+    and workbook_report
+    and frame_for(workbook_report, "purchasing_loads")[1] is not None
+    and not frame_for(workbook_report, "purchasing_loads")[1].empty
+)
+navigation_pages = ["Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown"]
+if harvest_view_available:
+    navigation_pages.append("Harvest & Sales")
+if purchasing_view_available:
+    navigation_pages.append("Purchasing & Loads")
+navigation_pages.append("Data Explorer & Quality")
+active_page = render_sidebar_navigation(navigation_pages)
+
+# Demo Mode belongs directly beneath the hero/header so first-time users see
+# that the dashboard is using sample data before the KPI and filter sections.
+# Keep the existing conditional and markup unchanged; real workbook data hides
+# this notice automatically because ``workbook_report`` is populated.
+if active_page == "Executive Overview" and workbook_report is None:
+    st.markdown(
+        "<div class='cs-demo-mode'>"
+        "<div class='cs-demo-mode-icon' aria-hidden='true'>i</div>"
+        "<div class='cs-demo-mode-copy'>"
+        "<div class='cs-demo-mode-title'>Demo Mode</div>"
+        "<div class='cs-demo-mode-message'>You're viewing sample inventory data. Upload your Excel workbook to see your company's actual data.</div>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+# The KPI row is shared by the dashboard pages, but Settings should start
+# directly with its own controls. Keep the shared renderer and calculations
+# intact while skipping only its visible output on the Settings page.
+if active_page != "Settings":
+    render_kpi_cards(stored, demand, balance, missing_metric_label)
 
 if workbook_report:
     if SHOW_DATA_QUALITY_UI:
@@ -964,46 +1299,65 @@ if workbook_report is not None and source_sheet == workbook_report.semantic_shee
     cm_col, upcoming_col = st.columns(2)
     with cm_col:
         with st.container(key="contribution_metric"):
-            st.metric("Contribution margin", f"${contribution:,.0f}" if pd.notna(contribution) else "Not available from selected worksheet")
+            st.metric("Weekly Contribution Margin", f"${contribution:,.0f}" if pd.notna(contribution) else "Not available from selected worksheet")
     with upcoming_col:
         with st.container(key="upcoming_planned_metric"):
-            st.metric("Upcoming planned pounds", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
+            st.metric("Next 4 Weeks' Planned Sales", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
 
-with st.container(key="filters_panel", border=True):
-    st.markdown("#### Filters")
-    filter_row_one = st.columns(4, gap="small")
-    with filter_row_one[0]:
-        st.multiselect("Year", year_options, key=filter_keys["year"], placeholder="All years")
-    with filter_row_one[1]:
-        st.multiselect("Reporting week", week_options, key=filter_keys["week"], placeholder="All weeks")
-    with filter_row_one[2]:
-        st.multiselect("Variety", options(df, "variety"), key=filter_keys["variety"], placeholder="All varieties")
-    with filter_row_one[3]:
-        st.multiselect("Organic / conventional", options(df, "classification"), key=filter_keys["classification"], placeholder="All classifications")
-    filter_row_two = st.columns(4, gap="small")
-    with filter_row_two[0]:
-        st.multiselect("Size", options(df, "size"), key=filter_keys["size"], placeholder="All sizes")
-    with filter_row_two[1]:
-        st.multiselect("Product", options(df, "product"), key=filter_keys["product"], placeholder="All products")
-    with filter_row_two[2]:
-        st.multiselect("Packaging type", options(df, "packaging_type"), key=filter_keys["packaging_type"], placeholder="All packaging")
-    with filter_row_two[3]:
-        def reset_filters() -> None:
-            for key in filter_keys.values():
-                st.session_state[key] = []
+if active_page != "Settings":
+    with st.container(key="filters_panel", border=True):
+        filter_header_left, filter_header_right = st.columns([4, 1], gap="small", vertical_alignment="center")
+        with filter_header_left:
+            st.markdown(
+                f"<div class='cs-filter-heading'><span class='cs-filter-heading-icon'>{dashboard_icon('filter', size=32)}</span>"
+                "<strong class='cs-filter-heading-title'>Filters</strong></div>",
+                unsafe_allow_html=True,
+            )
+        with filter_header_right:
+            def reset_filters() -> None:
+                for key in filter_keys.values():
+                    st.session_state[key] = []
+                st.session_state["filter_classification_segment"] = "All"
 
-        st.button("Reset filters", width="stretch", on_click=reset_filters)
+            st.button(
+                "Reset filters",
+                icon=":material/refresh:",
+                width="stretch",
+                on_click=reset_filters,
+                key="reset_filters_button",
+            )
+
+        filter_row = st.columns([0.9, 1.15, 1.05, 1.8, 0.9], gap="small", vertical_alignment="bottom")
+        with filter_row[0]:
+            with st.container(key="filter_tile_year"):
+                st.markdown(f"<div class='cs-filter-control-label'>{dashboard_icon('calendar-days', size=26)}<strong>Year</strong></div>", unsafe_allow_html=True)
+                st.multiselect("Year", year_options, key=filter_keys["year"], placeholder="All years", label_visibility="collapsed")
+        with filter_row[1]:
+            with st.container(key="filter_tile_week"):
+                st.markdown(f"<div class='cs-filter-control-label'>{dashboard_icon('calendar-range', size=26)}<strong>Reporting week</strong></div>", unsafe_allow_html=True)
+                st.multiselect("Reporting week", week_options, key=filter_keys["week"], placeholder="All weeks", label_visibility="collapsed")
+        with filter_row[2]:
+            with st.container(key="filter_tile_variety"):
+                st.markdown(f"<div class='cs-filter-control-label'>{dashboard_icon('sprout', size=26)}<strong>Variety</strong></div>", unsafe_allow_html=True)
+                st.multiselect("Variety", options(df, "variety"), key=filter_keys["variety"], placeholder="All varieties", label_visibility="collapsed")
+        with filter_row[3]:
+            with st.container(key="filter_tile_classification"):
+                st.markdown(f"<div class='cs-filter-control-label'>{dashboard_icon('layers-2', size=26)}<strong>Organic / conventional</strong></div>", unsafe_allow_html=True)
+                st.segmented_control(
+                    "Organic / conventional",
+                    ["All", "Organic", "Conventional"],
+                    selection_mode="single",
+                    key="filter_classification_segment",
+                    on_change=sync_classification_filter,
+                    label_visibility="collapsed",
+                    width="stretch",
+                )
+        with filter_row[4]:
+            with st.container(key="filter_tile_size"):
+                st.markdown(f"<div class='cs-filter-control-label'>{dashboard_icon('scaling', size=26)}<strong>Size</strong></div>", unsafe_allow_html=True)
+                st.multiselect("Size", options(df, "size"), key=filter_keys["size"], placeholder="All sizes", label_visibility="collapsed")
 
 visualization_started = perf_counter()
-harvest_view_available = bool(workbook_report and frame_for(workbook_report, "harvest_sales")[1] is not None and not frame_for(workbook_report, "harvest_sales")[1].empty)
-purchasing_view_available = bool(workbook_report and frame_for(workbook_report, "purchasing_loads")[1] is not None and not frame_for(workbook_report, "purchasing_loads")[1].empty)
-navigation_pages = ["Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown"]
-if harvest_view_available:
-    navigation_pages.append("Harvest & Sales")
-if purchasing_view_available:
-    navigation_pages.append("Purchasing & Loads")
-navigation_pages.append("Data Explorer & Quality")
-active_page = render_sidebar_navigation(navigation_pages)
 
 
 def source_frame_for(semantic: str, measures: list[str]) -> tuple[str | None, pd.DataFrame | None]:
@@ -1067,16 +1421,6 @@ if active_page == "Settings":
 
 if active_page == "Executive Overview":
     st.subheader("Executive overview")
-    if workbook_report is None:
-        st.markdown(
-            "<div class='cs-demo-mode'>"
-            "<div class='cs-demo-mode-icon' aria-hidden='true'>i</div>"
-            "<div class='cs-demo-mode-copy'>"
-            "<div class='cs-demo-mode-title'>Demo Mode</div>"
-            "<div class='cs-demo-mode-message'>You're viewing sample inventory data. Upload your Excel workbook to see your company's actual data.</div>"
-            "</div></div>",
-            unsafe_allow_html=True,
-        )
     if filtered.empty:
         st.warning("No rows match the current filters. Reset or broaden the filters to continue.", icon="⚠️")
     elif "stored_lbs" in filtered:
@@ -1201,13 +1545,16 @@ if purchasing_view_available:
             total_needed, needed_rows, needed_negative = source_sum("total_loads_needed")
             purchased, purchased_rows, purchased_negative = source_sum("purchased_loads")
             remaining, remaining_rows, remaining_negative = source_sum("remaining_loads")
-            metric_columns = st.columns(3)
             needed_label = "Total loads needed (review)" if needed_negative else "Total loads needed (source)"
             remaining_label = "Loads remaining (review)" if remaining_negative else "Loads remaining (source)"
-            metric_columns[0].metric(needed_label, f"{total_needed:,.2f}" if total_needed is not None else "Unavailable")
-            metric_columns[1].metric("Loads purchased (source)", f"{purchased:,.2f}" if purchased is not None else "Unavailable")
-            metric_columns[2].metric(remaining_label, f"{remaining:,.2f}" if remaining is not None else "Unavailable")
-            if any(value > 0 for value in [needed_negative, purchased_negative, remaining_negative]):
+            purchasing_metrics_valid = not any(value > 0 for value in [needed_negative, purchased_negative, remaining_negative])
+            if purchasing_metrics_valid:
+                metric_columns = st.columns(3)
+                metric_columns[0].metric(needed_label, f"{total_needed:,.2f}" if total_needed is not None else "Unavailable")
+                metric_columns[1].metric("Loads purchased (source)", f"{purchased:,.2f}" if purchased is not None else "Unavailable")
+                metric_columns[2].metric(remaining_label, f"{remaining:,.2f}" if remaining is not None else "Unavailable")
+            else:
+                st.caption("Purchasing summary metrics are hidden because the POs source contains negative load values requiring review.")
                 st.caption("⚠️ Review required: the POs worksheet contains negative load values. They are displayed exactly as supplied and were not converted to zero or absolute values.")
             st.caption(
                 f"Separate valid-cell totals: needed {needed_rows} rows, purchased {purchased_rows} rows, remaining {remaining_rows} rows. These populations do not fully reconcile because some purchased cells have invalid or missing needed/remaining values. POs formula errors remain listed in the quality report."
@@ -1219,18 +1566,65 @@ if purchasing_view_available:
                         po_rows[["product", "total_loads_needed", "purchased_loads", "remaining_loads", "source_cells", "source_period"]],
                         width="stretch", hide_index=True,
                     )
-            render_chart(lambda: load_comparison(purchasing_filtered), "purchasing_loads", "Purchased and remaining loads from POs")
-            st.caption("Loads per Week is plotted as an overall weekly trend. Product and variety filters above still apply; blank cells are omitted and source zeros remain zeros. The source does not provide a crop year.")
-            render_chart(lambda: loads_timeline(purchasing_filtered), "weekly_loads", "Overall weekly loads from Loads per Week")
+            if SHOW_PURCHASING_LOAD_CHARTS:
+                render_chart(lambda: load_comparison(purchasing_filtered), "purchasing_loads", "Purchased and remaining loads from POs")
+                st.caption("Loads per Week is plotted as an overall weekly trend. Product and variety filters above still apply; blank cells are omitted and source zeros remain zeros. The source does not provide a crop year.")
+                render_chart(lambda: loads_timeline(purchasing_filtered), "weekly_loads", "Overall weekly loads from Loads per Week")
 
 if active_page == "Data Explorer & Quality":
     st.subheader("Data explorer & quality")
-    if workbook_report:
+    if workbook_report and SHOW_DATA_EXPLORER_DIAGNOSTICS:
         st.dataframe(report_to_frame(workbook_report), width="stretch", hide_index=True)
-    search = st.text_input("Search verified records", placeholder="Product, variety, packaging, or source value")
-    explorer_df = filtered[filtered.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)] if search else filtered
+    component_result = None
+    if _inventory_explorer_autocomplete is not None:
+        previous_search = st.session_state.get("inventory_explorer_last_query")
+        component_state = st.session_state.get("inventory_explorer_autocomplete", {})
+        if not isinstance(component_state, dict):
+            component_state = {}
+        search = str(component_state.get("query") or "")
+        suggestions_open = bool(component_state.get("open") and search.strip())
+        suggestions = inventory_explorer_suggestions(filtered, search)
+        suggestion_payload = [dict(item, id=str(index)) for index, item in enumerate(suggestions)]
+        component_result = _inventory_explorer_autocomplete(
+            data={
+                "query": search,
+                "suggestions": suggestion_payload,
+                "no_matches": bool(search.strip() and not suggestions),
+                "open": suggestions_open,
+            },
+            default={"query": previous_search or "", "open": False},
+            key="inventory_explorer_autocomplete",
+            on_query_change=lambda: None,
+            on_open_change=lambda: None,
+        )
+    else:
+        search = st.text_input(
+            "Search verified records",
+            placeholder="Product, variety, classification, or size",
+            key="inventory_explorer_search",
+            on_change=clear_inventory_explorer_selection,
+        )
+
+    suggestions = inventory_explorer_suggestions(filtered, search)
+    suggestion_payload = [dict(item, id=str(index)) for index, item in enumerate(suggestions)]
+    suggestion_lookup = {str(item["id"]): item for item in suggestion_payload}
+    selected_id = None
+    if component_result is not None:
+        selected_id = component_result.get("selected")
+        if selected_id is not None:
+            st.session_state["inventory_explorer_selected_id"] = str(selected_id)
+        if previous_search != search:
+            st.session_state["inventory_explorer_selected_id"] = None
+        st.session_state["inventory_explorer_last_query"] = search
+
+    selected_id = st.session_state.get("inventory_explorer_selected_id") if selected_id is None else str(selected_id)
+    text_filtered = filtered[filtered.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)] if search else filtered
+    if selected_id and selected_id in suggestion_lookup:
+        explorer_df = filter_inventory_explorer_suggestion(filtered, suggestion_lookup[selected_id])
+    else:
+        explorer_df = text_filtered
     if explorer_df.empty:
-        st.info("No verified records match the current filters or search.")
+        st.info("No matching products" if search.strip() else "No verified records match the current filters.")
     else:
         st.dataframe(explorer_df, width="stretch", hide_index=True, alt="Searchable verified source records")
         st.download_button("Download verified records (CSV)", data=explorer_df.to_csv(index=False).encode("utf-8"), file_name="verified_records.csv", mime="text/csv")
