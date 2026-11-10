@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 
 
 LOGGER = logging.getLogger("country_sweet.excel")
-REPORT_SCHEMA_VERSION = "sheet-report-source-views-v6-variety-normalization"
+REPORT_SCHEMA_VERSION = "sheet-report-source-views-v8-pricing-reference-views"
 
 CANONICAL_COLUMNS = [
     "product", "variety", "classification", "size", "packaging_type", "units",
@@ -39,6 +39,8 @@ SALES_BOUNDS = (1, 61, 1, 67)              # A1:BO61
 PACKOUT_BOUNDS = (1, 51, 1, 35)            # A1:AI51
 PO_BOUNDS = (1, 44, 1, 7)                  # A1:G44
 LOADS_BOUNDS = (1, 46, 1, 71)              # A1:BS46
+PRICES_BOUNDS = (1, 250, 1, 8)             # A1:H250 (Prices pivot)
+PP_PRICE_TARGET_BOUNDS = (1, 100, 1, 12)  # A1:L100 (pricing/margin support)
 MONTH_NAMES = {
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -47,6 +49,7 @@ INITIAL_SHEETS = (
     "Current Week Model", "Forecasted Inventory Levels",
     "Forecast Harvest by Week HC", "Sales by Week", "Packout %",
     "POs", "Loads per Week",
+    "Prices", "PP Price Target",
 )
 
 ALIASES: dict[str, list[str]] = {
@@ -360,7 +363,8 @@ def _parse_forecasted_inventory(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFra
                 continue
             report_date = date_row[index]
             output.append({
-                "product": product, "variety": variety, "classification": row_classification, "size": size,
+                "product": product, "lookup_identifier": first, "product_description": description,
+                "variety": variety, "classification": row_classification, "size": size,
                 "packaging_type": "Bulk Bin", "units": "lbs", "stored_lbs": value,
                 "forecast_demand_lbs": pd.NA, "planned_sales_lbs": pd.NA, "starting_inventory_lbs": pd.NA,
                 "contribution_margin": pd.NA, "upcoming_demand_lbs": pd.NA,
@@ -369,6 +373,9 @@ def _parse_forecasted_inventory(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFra
                 "year": report_date.year if hasattr(report_date, "year") else pd.NA,
                 "week": week_row[index], "reporting_date": report_date,
                 "inventory_state": str(state_row[index]).title() if state_row[index] is not None else pd.NA,
+                "source_row": row_index + 1,
+                "source_cell": f"{get_column_letter(index + 1)}{row_index + 1}",
+                "source_sheet": "Forecasted Inventory Levels",
             })
     return normalize_frame(pd.DataFrame(output)), {"actual_date": actual_date, "columns": len(timeline_columns)}
 
@@ -487,7 +494,7 @@ def _parse_sales_by_week(rows: list[tuple[Any, ...]]) -> pd.DataFrame:
         return _canonical_empty()
     years, weeks = rows[0], rows[3]
     output: list[dict[str, Any]] = []
-    for row in rows[4:]:
+    for row_number, row in enumerate(rows[4:], start=5):
         raw_product = row[5] if len(row) > 5 else None
         if not raw_product or str(raw_product).strip() in {"Total", "Lookups"}:
             continue
@@ -499,11 +506,15 @@ def _parse_sales_by_week(rows: list[tuple[Any, ...]]) -> pd.DataFrame:
             if pd.isna(value) or pd.isna(week):
                 continue
             output.append({
-                "product": product, "variety": variety, "classification": classification, "size": size,
+                "product": product, "lookup_identifier": raw_product,
+                "variety": variety, "classification": classification, "size": size,
                 "packaging_type": "Bulk Bin", "units": "lbs", "planned_sales_lbs": value,
                 "year": year, "week": week, "period_label": f"{int(year)} W{int(week):02d}",
                 "source_period": "Crop years 2026–2027; weeks 1–53",
                 "reporting_date": pd.NaT,
+                "source_row": row_number,
+                "source_cell": f"{get_column_letter(column_index + 1)}{row_number}",
+                "source_sheet": "Sales by Week",
             })
     return normalize_frame(pd.DataFrame(output))
 
@@ -623,6 +634,106 @@ def _parse_loads_per_week(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFrame, di
     return normalize_frame(pd.DataFrame(output)), {"duplicate_weeks": sorted(duplicate_weeks), "weeks": sorted(observed_weeks)}
 
 
+def _pricing_period(rows: list[tuple[Any, ...]], sheet_name: str) -> str:
+    """Describe the period selector shown on a pricing worksheet."""
+    for row in rows[:12]:
+        for index, value in enumerate(row[:-1]):
+            if _norm(value) in {"year", "crop year", "reporting year", "period"}:
+                selected = row[index + 1]
+                if selected is None or not str(selected).strip():
+                    selected = "not supplied"
+                return f"{sheet_name} · {str(value).strip()} = {str(selected).strip()}"
+    return f"{sheet_name} · period not supplied"
+
+
+def _price_classification(*values: object) -> str | None:
+    """Infer classification only from an explicit Organic/Conventional marker."""
+    text = " ".join(str(value) for value in values if value is not None and not pd.isna(value))
+    if re.search(r"\b(?:org\.?|organic)\b", text, flags=re.IGNORECASE):
+        return "Organic"
+    if re.search(r"\b(?:conv\.?|conventional)\b", text, flags=re.IGNORECASE):
+        return "Conventional"
+    return None
+
+
+def _parse_prices(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Parse the Prices pivot without treating its all-year selector as current-week data."""
+    output: list[dict[str, Any]] = []
+    source_period = _pricing_period(rows, "Prices")
+    for row_number, row in enumerate(rows[4:], start=5):
+        raw_product = row[1] if len(row) > 1 else None
+        variety_id = row[2] if len(row) > 2 else None
+        size_id = row[3] if len(row) > 3 else None
+        if raw_product is None or not str(raw_product).strip():
+            continue
+        product = str(raw_product).strip()
+        if product.casefold() in {"grand total", "total", "variety idsize id"}:
+            continue
+        classification = _price_classification(product, variety_id)
+        _, inferred_variety, inferred_size, inferred_classification = _label_metadata(product, variety_id, size_id)
+        classification = classification or inferred_classification
+        variety = _canonical_variety(inferred_variety)
+        size = str(size_id).strip() if size_id is not None and str(size_id).strip() else inferred_size
+        plan_lbs = _numeric(row[4] if len(row) > 4 else None)
+        plan_revenue = _numeric(row[5] if len(row) > 5 else None)
+        reference_price = _numeric(row[6] if len(row) > 6 else None)
+        price_40 = _numeric(row[7] if len(row) > 7 else None)
+        calculated_price = pd.NA
+        price_consistent = False
+        if pd.notna(plan_lbs) and float(plan_lbs) > 0 and pd.notna(plan_revenue) and pd.notna(reference_price):
+            calculated_price = float(plan_revenue) / float(plan_lbs)
+            price_consistent = abs(float(reference_price) - calculated_price) <= max(0.005, abs(calculated_price) * 0.005)
+        output.append({
+            "product": product,
+            "variety": variety,
+            "classification": classification,
+            "size": size,
+            "planned_lbs": plan_lbs,
+            "planned_revenue": plan_revenue,
+            "reference_price_lbs": reference_price,
+            "reference_price_40lb": price_40,
+            "calculated_price_lbs": calculated_price,
+            "price_consistent": price_consistent,
+            "price_validation": "Verified against plan revenue ÷ plan lbs" if price_consistent else "Not verified",
+            "source_row": row_number,
+            "source_cell": f"G{row_number}",
+            "source_sheet": "Prices",
+            "source_period": source_period,
+        })
+    return normalize_frame(pd.DataFrame(output)), {"source_period": source_period}
+
+
+def _parse_pp_price_target(rows: list[tuple[Any, ...]]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Parse PP Price Target for separate margin context; do not use it as a price source."""
+    output: list[dict[str, Any]] = []
+    source_period = _pricing_period(rows, "PP Price Target")
+    for row_number, row in enumerate(rows[2:], start=3):
+        raw_product = row[2] if len(row) > 2 else None
+        variety_id = row[3] if len(row) > 3 else None
+        size_id = row[4] if len(row) > 4 else None
+        if raw_product is None or not str(raw_product).strip():
+            continue
+        product = str(raw_product).strip()
+        if product.casefold() in {"grand total", "total"}:
+            continue
+        _, inferred_variety, inferred_size, inferred_classification = _label_metadata(product, variety_id, size_id)
+        output.append({
+            "product": product,
+            "variety": _canonical_variety(inferred_variety),
+            "classification": _price_classification(product, variety_id) or inferred_classification,
+            "size": str(size_id).strip() if size_id is not None and str(size_id).strip() else inferred_size,
+            "avg_sales_price_40lb": _numeric(row[5] if len(row) > 5 else None),
+            "avg_standard_cost_40lb": _numeric(row[6] if len(row) > 6 else None),
+            "contribution_margin_40lb": _numeric(row[7] if len(row) > 7 else None),
+            "pp_price_target_40lb": _numeric(row[8] if len(row) > 8 else None),
+            "source_row": row_number,
+            "source_cell": f"F{row_number}:I{row_number}",
+            "source_sheet": "PP Price Target",
+            "source_period": source_period,
+        })
+    return normalize_frame(pd.DataFrame(output)), {"source_period": source_period}
+
+
 def _report_for_frame(name: str, status: str, semantic: str, frame: pd.DataFrame, elapsed_ms: float, formula_quality: tuple[int, int, int, list[str], list[str]]) -> SheetReport:
     formula_cells, formula_errors, missing_results, error_cells, missing_cells = formula_quality
     return SheetReport(
@@ -709,6 +820,8 @@ def load_inventory_workbook(content: bytes, progress_callback: Callable[[str], N
         ("Packout %", PACKOUT_BOUNDS, "packout_source", _parse_packout),
         ("POs", PO_BOUNDS, "po_source", _parse_pos),
         ("Loads per Week", LOADS_BOUNDS, "loads_source", _parse_loads_per_week),
+        ("Prices", PRICES_BOUNDS, "prices_source", _parse_prices),
+        ("PP Price Target", PP_PRICE_TARGET_BOUNDS, "pp_price_target_source", _parse_pp_price_target),
     ]
     extra_meta: dict[str, Any] = {}
     for sheet, bounds, semantic, parser in extra_specs:

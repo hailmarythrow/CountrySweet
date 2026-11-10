@@ -31,6 +31,16 @@ from utils.excel_loader import REPORT_SCHEMA_VERSION, frame_for, load_inventory_
 from utils.theme import apply_theme
 from utils.ui import render_chart, render_quality_summary, render_upload_error, render_upload_success, source_caption
 from utils.validation import apply_filters, options, source_period
+from utils.x_blocking import (
+    build_comparison,
+    build_organic_outlook,
+    comparison_periods,
+    organic_horizon_options,
+    pricing_assessment,
+    reference_price_comparison,
+    reconciliation_report,
+    source_inventory,
+)
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "Country_Sweet_Produce_Logo_HD.png"
 SIDEBAR_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "bakosweet.png"
@@ -86,6 +96,9 @@ SHOW_PURCHASING_LOAD_CHARTS = False
 # Keep the Purchasing & Loads parsers and page implementation available, but
 # temporarily remove the page from the employee-facing navigation.
 SHOW_PURCHASING_LOADS = False
+X_BLOCKING_SCENARIO_QUANTITY_KEY = "x_blocking_scenario_quantity"
+X_BLOCKING_SCENARIO_SLIDER_KEY = "x_blocking_scenario_slider"
+X_BLOCKING_SCENARIO_EXACT_KEY = "x_blocking_scenario_exact"
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -101,6 +114,20 @@ def get_welcome(timezone: str = "America/Los_Angeles") -> tuple[str, str, str]:
     now = datetime.now(ZoneInfo(timezone))
     greeting = "Good Morning" if now.hour < 12 else "Good Afternoon" if now.hour < 17 else "Good Evening"
     return greeting, now.strftime("%A, %B %d, %Y"), now.strftime("%I:%M:%S %p %Z")
+
+
+def _sync_x_blocking_from_slider() -> None:
+    """Use the slider's 100-lb position as the canonical scenario quantity."""
+    st.session_state[X_BLOCKING_SCENARIO_QUANTITY_KEY] = int(
+        st.session_state.get(X_BLOCKING_SCENARIO_SLIDER_KEY, 0)
+    )
+
+
+def _sync_x_blocking_from_exact_input() -> None:
+    """Preserve an exact whole-pound scenario quantity entered by the user."""
+    st.session_state[X_BLOCKING_SCENARIO_QUANTITY_KEY] = int(
+        st.session_state.get(X_BLOCKING_SCENARIO_EXACT_KEY, 0)
+    )
 
 
 def demo_data() -> pd.DataFrame:
@@ -519,6 +546,7 @@ def render_sidebar_navigation(page_names: list[str]) -> str:
         "Inventory Timeline": ":material/timeline:",
         "Organic vs. Conventional": ":material/compare_arrows:",
         "Product Breakdown": ":material/inventory_2:",
+        "X-Blocking Analysis": ":material/compare:",
         "Harvest & Sales": ":material/warehouse:",
         "Purchasing & Loads": ":material/local_shipping:",
         "Data Explorer & Quality": ":material/search:",
@@ -1074,9 +1102,11 @@ if uploaded is not None and not refresh_clicked:
                 LOGGER.info("excel.upload filename=%s bytes=%d elapsed_ms=%.1f content_id=%s", uploaded.name, len(uploaded_bytes), (perf_counter() - upload_started) * 1000, upload_id[:12])
                 upload_status.update(label="Complete", state="complete")
                 LOGGER.info("excel.stage Complete filename=%s total_elapsed_ms=%.1f", uploaded.name, (perf_counter() - upload_started) * 1000)
-                # Render the uploader again with its post-upload label and
-                # current workbook metadata immediately after activation.
-                st.rerun()
+                # The current run already has the verified report and session
+                # metadata. Do not force a second rerun while Streamlit is
+                # still finalizing the file-uploader event; that extra rerun
+                # can interrupt the uploader WebSocket and surface a false
+                # "Connection lost" state even when parsing succeeded.
             except Exception as exc:
                 LOGGER.exception("excel.upload_failed filename=%s", uploaded.name)
                 load_error = str(exc)
@@ -1221,9 +1251,6 @@ record_stage_counts = {
     "Records after filters": len(filtered),
     "Records sent to overview visualizations": len(filtered),
 }
-if not df.empty and filtered.empty:
-    st.warning("No records match the selected filters. Blank filters mean All; use Reset filters to restore the complete verified dataset.", icon="⚠️")
-
 period = source_period(df) if not df.empty else "Reporting period not supplied"
 
 if not filtered.empty and "stored_lbs" in filtered:
@@ -1249,13 +1276,28 @@ purchasing_view_available = bool(
     and frame_for(workbook_report, "purchasing_loads")[1] is not None
     and not frame_for(workbook_report, "purchasing_loads")[1].empty
 )
-navigation_pages = ["Executive Overview", "Inventory Timeline", "Organic vs. Conventional", "Product Breakdown"]
+navigation_pages = ["Executive Overview", "Inventory Timeline", "Product Breakdown", "X-Blocking Analysis"]
 if harvest_view_available:
     navigation_pages.append("Harvest & Sales")
 if purchasing_view_available:
     navigation_pages.append("Purchasing & Loads")
 navigation_pages.append("Data Explorer & Quality")
 active_page = render_sidebar_navigation(navigation_pages)
+
+# This warning belongs only to pages that actually render the shared
+# inventory-filter dataset. X-Blocking and Settings use independent layouts
+# and must not inherit a contradictory warning from the primary worksheet.
+FILTER_WARNING_PAGES = {
+    "Executive Overview",
+    "Inventory Timeline",
+    "Organic vs. Conventional",
+    "Product Breakdown",
+    "Harvest & Sales",
+    "Purchasing & Loads",
+    "Data Explorer & Quality",
+}
+if active_page in FILTER_WARNING_PAGES and not df.empty and filtered.empty:
+    st.warning("No records match the selected filters. Blank filters mean All; use Reset filters to restore the complete verified dataset.", icon="⚠️")
 
 # Demo Mode belongs directly beneath the hero/header so first-time users see
 # that the dashboard is using sample data before the KPI and filter sections.
@@ -1275,7 +1317,7 @@ if active_page == "Executive Overview" and workbook_report is None:
 # The KPI row is shared by the dashboard pages, but Settings should start
 # directly with its own controls. Keep the shared renderer and calculations
 # intact while skipping only its visible output on the Settings page.
-if active_page != "Settings":
+if active_page not in {"Settings", "X-Blocking Analysis"}:
     render_kpi_cards(stored, demand, balance, missing_metric_label)
 
 if workbook_report:
@@ -1304,7 +1346,7 @@ if workbook_report is not None and source_sheet == workbook_report.semantic_shee
         with st.container(key="upcoming_planned_metric"):
             st.metric("Next 4 Weeks' Planned Sales", f"{upcoming:,.0f} lbs" if pd.notna(upcoming) else "Not available from selected worksheet")
 
-if active_page != "Settings":
+if active_page not in {"Settings", "X-Blocking Analysis"}:
     with st.container(key="filters_panel", border=True):
         filter_header_left, filter_header_right = st.columns([4, 1], gap="small", vertical_alignment="center")
         with filter_header_left:
@@ -1418,6 +1460,267 @@ if active_page == "Settings":
     )
     st.caption("The header updates after you apply a location or change units.")
     st.caption("Additional customization options will be introduced in a future update.")
+
+if active_page == "X-Blocking Analysis":
+    st.subheader("X-Blocking Analysis")
+    st.write(
+        "Compare workbook-supplied organic and conventional inventory with the matching planned-demand period. "
+        "This view does not determine whether any organic pounds are eligible for conversion."
+    )
+    if workbook_report is None:
+        st.info("Upload and successfully validate a workbook to inspect X-blocking-related inventory and demand.")
+    else:
+        timeline_sheet, timeline_frame = frame_for(workbook_report, "inventory_timeline")
+        harvest_sheet, harvest_frame = frame_for(workbook_report, "harvest_sales")
+        sales_sheet, sales_frame = frame_for(workbook_report, "sales_source")
+        if timeline_frame is None or timeline_frame.empty:
+            st.warning("Forecasted Inventory Levels is not available as a verified source, so no inventory comparison can be shown.")
+        else:
+            periods = comparison_periods(timeline_frame)
+            if periods.empty:
+                st.warning("No ACTUAL or FORECAST periods were detected in Forecasted Inventory Levels.")
+            else:
+                st.markdown("#### Comparison filters")
+                period_labels = periods["selection_label"].tolist()
+                actual_indices = [index for index, state in enumerate(periods["state"].tolist()) if state == "Actual"]
+                default_period_index = actual_indices[-1] if actual_indices else 0
+                selected_period_label = st.selectbox(
+                    "Reporting week",
+                    period_labels,
+                    index=default_period_index,
+                    key="x_blocking_reporting_week",
+                )
+                selected_period = periods.loc[periods["selection_label"] == selected_period_label].iloc[0]
+                variety_values = sorted(
+                    {
+                        str(value).strip()
+                        for frame in (timeline_frame, harvest_frame, sales_frame)
+                        if frame is not None and "variety" in frame
+                        for value in frame["variety"].dropna().tolist()
+                        if str(value).strip()
+                    },
+                    key=str.casefold,
+                )
+                size_values = sorted(
+                    {
+                        str(value).strip()
+                        for frame in (timeline_frame, harvest_frame, sales_frame)
+                        if frame is not None and "size" in frame
+                        for value in frame["size"].dropna().tolist()
+                        if str(value).strip()
+                    },
+                    key=str.casefold,
+                )
+                x_filter_left, x_filter_right = st.columns(2, gap="small")
+                with x_filter_left:
+                    selected_varieties = st.multiselect(
+                        "Organic variety",
+                        variety_values,
+                        key="x_blocking_variety",
+                        placeholder="All varieties",
+                    )
+                with x_filter_right:
+                    selected_sizes = st.multiselect(
+                        "Size",
+                        size_values,
+                        key="x_blocking_size",
+                        placeholder="All sizes",
+                    )
+                horizon_values = organic_horizon_options(timeline_frame, selected_period)
+                selected_horizon = st.selectbox(
+                    "Planning horizon",
+                    horizon_values or ["1 week"],
+                    key="x_blocking_horizon",
+                )
+                comparison, comparison_meta = build_comparison(
+                    timeline_frame,
+                    sales_frame,
+                    selected_period,
+                    selected_varieties,
+                    selected_sizes,
+                )
+                if comparison.empty:
+                    st.info("No verified inventory rows match the selected reporting week, variety, and size filters.")
+                else:
+                    inventory_measure = f"{selected_period['state']} inventory"
+                    card_data = {}
+                    for classification, label in (("Organic", "Organic"), ("Conventional", "Conventional")):
+                        selected_class = comparison[
+                            comparison["classification"].astype("string").str.casefold() == classification.casefold()
+                        ]
+                        card_data[f"{label} inventory"] = selected_class["inventory_lbs"].sum(min_count=1) if not selected_class.empty else pd.NA
+                        card_data[f"{label} demand"] = selected_class["demand_lbs"].sum(min_count=1) if not selected_class.empty else pd.NA
+
+                    def display_lbs(value: object) -> str:
+                        if value is None or pd.isna(value):
+                            return "—"
+                        return f"{float(value):,.0f} lbs"
+
+                    summary_cards = [
+                        (f"Organic {selected_period['state']} inventory", card_data["Organic inventory"]),
+                        (f"Organic planned demand · Week {int(selected_period['week'])}", card_data["Organic demand"]),
+                        (f"Conventional {selected_period['state']} inventory", card_data["Conventional inventory"]),
+                        (f"Conventional planned demand · Week {int(selected_period['week'])}", card_data["Conventional demand"]),
+                    ]
+                    summary_columns = st.columns(4, gap="small")
+                    for column, (label, value) in zip(summary_columns, summary_cards):
+                        with column:
+                            st.metric(label, display_lbs(value))
+
+                    organic_inventory = card_data["Organic inventory"]
+                    organic_demand = card_data["Organic demand"]
+                    if pd.notna(organic_inventory) and pd.notna(organic_demand):
+                        # Keep this derived value available for future X-Blocking
+                        # scenarios, but do not expose it in the current UI.
+                        organic_above_demand = float(organic_inventory) - float(organic_demand)
+                    st.markdown("#### Organic vs. Conventional inventory")
+                    classification_frame = comparison[
+                        comparison["classification"].astype("string").str.casefold().isin(
+                            {"organic", "conventional"}
+                        )
+                    ][["classification", "inventory_lbs"]].rename(
+                        columns={"inventory_lbs": "stored_lbs"}
+                    )
+                    if classification_frame.empty:
+                        st.info("No verified organic/conventional inventory is available for this selection.")
+                    else:
+                        render_chart(
+                            lambda: classification_comparison(classification_frame),
+                            "x_blocking_classification_comparison",
+                            "Organic and conventional inventory comparison",
+                        )
+                    detail_columns = [
+                        column for column in ["product", "variety", "size", "classification", "inventory_lbs", "demand_lbs"]
+                        if column in comparison
+                    ]
+                    detail_table = comparison[detail_columns].rename(
+                        columns={
+                            "product": "Product",
+                            "variety": "Variety",
+                            "size": "Size",
+                            "classification": "Classification",
+                            "inventory_lbs": f"{inventory_measure.title()} (lbs)",
+                            "demand_lbs": "Planned demand (lbs)",
+                        }
+                    ).copy()
+                    for numeric_column in [column for column in detail_table.columns if column.endswith("(lbs)")]:
+                        detail_table[numeric_column] = detail_table[numeric_column].map(display_lbs)
+                    st.dataframe(detail_table, width="stretch", hide_index=True)
+                    # Keep the workbook reconciliation calculation active for
+                    # internal diagnostics, but do not expose its developer
+                    # table in the everyday X-Blocking interface.
+                    _reconciliation = reconciliation_report(
+                        timeline_frame,
+                        sales_frame,
+                        selected_period,
+                        selected_varieties,
+                        selected_sizes,
+                    )
+                    if comparison["classification"].astype("string").str.casefold().eq("unclassified").any():
+                        st.warning("Some rows do not have a verified organic/conventional classification and are not included in the classification columns.")
+                    st.markdown("#### Organic Inventory Outlook")
+                    outlook = build_organic_outlook(
+                        timeline_frame,
+                        harvest_frame,
+                        sales_frame,
+                        selected_period,
+                        selected_horizon,
+                        selected_varieties,
+                        selected_sizes,
+                    )
+                    outlook_periods = outlook["future_periods"]
+                    if outlook_periods.empty:
+                        st.info("No compatible future forecast periods are available for the selected organic product.")
+                    else:
+                        outlook_cards = [
+                            ("Starting organic inventory", outlook["starting_lbs"]),
+                            ("Planned incoming harvest", outlook["harvest_lbs"]),
+                            ("Planned organic sales", outlook["sales_lbs"]),
+                            ("Projected ending organic inventory", outlook["ending_lbs"]),
+                        ]
+                        outlook_columns = st.columns(4, gap="small")
+                        for column, (label, value) in zip(outlook_columns, outlook_cards):
+                            with column:
+                                st.metric(label, display_lbs(value))
+                        if outlook["reconciled"]:
+                            st.success("The displayed workbook components reconcile to the projected ending balance for this selection.")
+                        # Keep non-reconciled workbook diagnostics in ``outlook``
+                        # for internal use, but do not expose the warning in this
+                        # compact X-Blocking view.
+                    st.markdown("#### Potential opportunity cost")
+                    financial_status = pricing_assessment(workbook_report)
+                    price_comparison = reference_price_comparison(
+                        workbook_report,
+                        selected_varieties,
+                        selected_sizes,
+                    )
+                    if price_comparison.get("paired"):
+                        price_columns = st.columns(3, gap="small")
+                        with price_columns[0]:
+                            st.metric("Organic reference price", f"${price_comparison['organic_price']:,.4f} / lb")
+                        with price_columns[1]:
+                            st.metric("Conventional reference price", f"${price_comparison['conventional_price']:,.4f} / lb")
+                        with price_columns[2]:
+                            st.metric(
+                                "Conventional − organic price difference",
+                                f"${price_comparison['gross_sales_difference_per_lb']:,.4f} / lb",
+                            )
+                        verified_organic_inventory = (
+                            int(max(0.0, float(organic_inventory)))
+                            if organic_inventory is not None and pd.notna(organic_inventory)
+                            else 0
+                        )
+                        previous_quantity = int(
+                            st.session_state.get(X_BLOCKING_SCENARIO_QUANTITY_KEY, 0) or 0
+                        )
+                        quantity_was_reduced = previous_quantity > verified_organic_inventory
+                        scenario_quantity = min(
+                            max(previous_quantity, 0),
+                            verified_organic_inventory,
+                        )
+                        slider_maximum = (verified_organic_inventory // 100) * 100
+                        slider_position = min(
+                            slider_maximum,
+                            int(round(scenario_quantity / 100.0) * 100),
+                        )
+                        st.session_state[X_BLOCKING_SCENARIO_QUANTITY_KEY] = scenario_quantity
+                        st.session_state[X_BLOCKING_SCENARIO_SLIDER_KEY] = slider_position
+                        st.session_state[X_BLOCKING_SCENARIO_EXACT_KEY] = scenario_quantity
+                        if quantity_was_reduced:
+                            st.info(
+                                f"The previous scenario amount exceeded the verified organic inventory ceiling; "
+                                f"it was reduced to {scenario_quantity:,} lbs."
+                            )
+                        st.slider(
+                            "Organic pounds considered for X-blocking",
+                            min_value=0,
+                            max_value=slider_maximum,
+                            step=100,
+                            key=X_BLOCKING_SCENARIO_SLIDER_KEY,
+                            on_change=_sync_x_blocking_from_slider,
+                        )
+                        st.number_input(
+                            "Exact organic pounds",
+                            min_value=0,
+                            max_value=verified_organic_inventory,
+                            step=1,
+                            format="%d",
+                            key=X_BLOCKING_SCENARIO_EXACT_KEY,
+                            on_change=_sync_x_blocking_from_exact_input,
+                        )
+                        scenario_pounds = int(
+                            st.session_state.get(X_BLOCKING_SCENARIO_QUANTITY_KEY, 0) or 0
+                        )
+                        hypothetical_difference = (
+                            0.0
+                            if scenario_pounds == 0
+                            else scenario_pounds * float(price_comparison["gross_sales_difference_per_lb"])
+                        )
+                        st.metric("Hypothetical gross sales value difference", f"${hypothetical_difference:,.2f}")
+                        st.caption("Scenario estimate only. Confirm pricing, eligibility, and sales assumptions before use.")
+                    else:
+                        message = str(price_comparison.get("message") or financial_status.get("detail") or financial_status["status"])
+                        st.warning(message)
 
 if active_page == "Executive Overview":
     st.subheader("Executive overview")
