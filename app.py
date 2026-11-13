@@ -65,6 +65,7 @@ from utils.firebase_auth import (
     validate_invitation,
     verify_id_token,
 )
+from utils.firebase_admin_client import get_firebase_app, runtime_setting
 from utils.x_blocking import (
     build_comparison,
     build_organic_outlook,
@@ -109,7 +110,7 @@ DEFAULT_LOCATION = {
     "longitude": -119.0187,
 }
 def _env_flag(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().casefold() in {"1", "true", "yes", "on"}
+    return str(runtime_setting(name, str(default))).strip().casefold() in {"1", "true", "yes", "on"}
 
 
 # Development-only local OneDrive-sync demonstration. This is deliberately
@@ -118,8 +119,11 @@ ENABLE_LOCAL_WORKBOOK_DEMO = _env_flag("BAKO_LOCAL_WORKBOOK_DEMO", False)
 # Development-only persistence is opt-in and never uses the production active
 # workbook metadata pointer. It stores dashboard-ready frames only.
 ENABLE_DEV_FIRESTORE_SNAPSHOTS = _env_flag("BAKO_DEV_FIRESTORE_SNAPSHOTS", False)
-DEV_SNAPSHOT_NAMESPACE = os.getenv("BAKO_DEV_FIRESTORE_SNAPSHOT_NAMESPACE", DEFAULT_DEV_SNAPSHOT_NAMESPACE).strip() or DEFAULT_DEV_SNAPSHOT_NAMESPACE
+DEV_SNAPSHOT_NAMESPACE = str(
+    runtime_setting("BAKO_DEV_FIRESTORE_SNAPSHOT_NAMESPACE", DEFAULT_DEV_SNAPSHOT_NAMESPACE)
+).strip() or DEFAULT_DEV_SNAPSHOT_NAMESPACE
 FIREBASE_AUTH_CONFIG = FirebaseAuthConfig.from_environment()
+FIREBASE_AUTH_REQUIRED = _env_flag("BAKO_FIREBASE_AUTH_REQUIRED", False)
 # This panel is a separate local-development aid for verifying an existing
 # Firebase account. It never grants dashboard access and is off by default.
 FIREBASE_AUTH_DEV_PANEL = _env_flag("BAKO_FIREBASE_AUTH_DEV_PANEL", False)
@@ -150,7 +154,7 @@ LOGGER.info(
     Path(__file__).resolve(),
     ENABLE_DEV_FIRESTORE_SNAPSHOTS,
     DEV_SNAPSHOT_NAMESPACE,
-    os.getenv("FIREBASE_PROJECT_ID", "bako-sweet"),
+    runtime_setting("FIREBASE_PROJECT_ID", "bako-sweet"),
 )
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
@@ -1370,6 +1374,33 @@ if "timezone" not in st.session_state:
     st.session_state.timezone = "America/Los_Angeles"
 
 apply_theme(True, HEADER_IMAGE_PATH)
+
+# Deployment mode is fail-closed.  Streamlit Cloud does not execute the
+# Windows launcher, so this gate verifies the values supplied through Secrets
+# before any workbook, snapshot, or dashboard content is rendered.
+if FIREBASE_AUTH_REQUIRED:
+    if not FIREBASE_AUTH_CONFIG.enabled:
+        st.error(
+            "Firebase Authentication is required for this deployment, but it is not enabled. "
+            "Configure BAKO_FIREBASE_AUTH_ENABLED=true in Streamlit Secrets."
+        )
+        st.stop()
+    if not FIREBASE_AUTH_CONFIG.web_ready:
+        st.error(
+            "Firebase Authentication is required, but the Firebase Web App configuration is incomplete. "
+            "Configure the Web API key, auth domain, App ID, and project ID in Streamlit Secrets."
+        )
+        st.stop()
+    try:
+        get_firebase_app()
+    except Exception as exc:
+        # Keep provider details and credential material out of the UI/logs.
+        LOGGER.warning("auth.required_admin_init_failed error_type=%s", type(exc).__name__)
+        st.error(
+            "Firebase server authentication is unavailable. The deployment administrator must "
+            "configure a valid Firebase Admin credential for project bako-sweet."
+        )
+        st.stop()
 
 # Optional verification-only panel. It intentionally runs while mandatory
 # authentication is disabled, so an existing Firebase user can request the

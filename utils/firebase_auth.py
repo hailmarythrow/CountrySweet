@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 from firebase_admin import auth, firestore
 
-from .firebase_admin_client import FIREBASE_PROJECT_ID, get_firebase_app, get_firestore_client
+from .firebase_admin_client import FIREBASE_PROJECT_ID, get_firebase_app, get_firestore_client, runtime_setting
 
 
 AUTH_BOOTSTRAP_COLLECTION = "bako_sweet_auth_bootstrap"
@@ -66,16 +66,16 @@ class FirebaseAuthConfig:
 
     @classmethod
     def from_environment(cls) -> "FirebaseAuthConfig":
-        enabled = os.getenv("BAKO_FIREBASE_AUTH_ENABLED", "false").strip().casefold() in {
+        enabled = str(runtime_setting("BAKO_FIREBASE_AUTH_ENABLED", "false")).strip().casefold() in {
             "1", "true", "yes", "on"
         }
         return cls(
             enabled=enabled,
-            project_id=os.getenv("FIREBASE_PROJECT_ID", FIREBASE_PROJECT_ID).strip(),
-            api_key=os.getenv("BAKO_FIREBASE_WEB_API_KEY", "").strip() or None,
-            auth_domain=os.getenv("BAKO_FIREBASE_AUTH_DOMAIN", "").strip() or None,
-            app_id=os.getenv("BAKO_FIREBASE_WEB_APP_ID", "").strip() or None,
-            require_email_verification=os.getenv("BAKO_FIREBASE_REQUIRE_EMAIL_VERIFICATION", "true").strip().casefold()
+            project_id=str(runtime_setting("FIREBASE_PROJECT_ID", FIREBASE_PROJECT_ID)).strip(),
+            api_key=str(runtime_setting("BAKO_FIREBASE_WEB_API_KEY", "")).strip() or None,
+            auth_domain=str(runtime_setting("BAKO_FIREBASE_AUTH_DOMAIN", "")).strip() or None,
+            app_id=str(runtime_setting("BAKO_FIREBASE_WEB_APP_ID", "")).strip() or None,
+            require_email_verification=str(runtime_setting("BAKO_FIREBASE_REQUIRE_EMAIL_VERIFICATION", "true")).strip().casefold()
             not in {"0", "false", "no", "off"},
         )
 
@@ -91,6 +91,7 @@ class FirebaseAuthConfig:
                 configured(self.auth_domain),
                 configured(self.app_id),
                 configured(self.project_id),
+                self.project_id == "bako-sweet",
             )
         )
 

@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import os
 import unittest
+import sys
+import types
 from unittest.mock import patch
 
 from utils.firebase_auth import (
@@ -56,6 +59,33 @@ class FirebaseAuthTests(unittest.TestCase):
             app_id="PASTE_FIREBASE_WEB_APP_ID_HERE",
         )
         self.assertFalse(placeholder.web_ready)
+
+    def test_auth_config_reads_streamlit_secrets_when_environment_is_absent(self):
+        fake_streamlit = types.SimpleNamespace(
+            secrets={
+                "BAKO_FIREBASE_AUTH_ENABLED": True,
+                "FIREBASE_PROJECT_ID": "bako-sweet",
+                "BAKO_FIREBASE_WEB_API_KEY": "secret-web-key",
+                "BAKO_FIREBASE_AUTH_DOMAIN": "bako-sweet.firebaseapp.com",
+                "BAKO_FIREBASE_WEB_APP_ID": "secret-app-id",
+                "BAKO_FIREBASE_REQUIRE_EMAIL_VERIFICATION": True,
+            }
+        )
+        names = [
+            "BAKO_FIREBASE_AUTH_ENABLED",
+            "FIREBASE_PROJECT_ID",
+            "BAKO_FIREBASE_WEB_API_KEY",
+            "BAKO_FIREBASE_AUTH_DOMAIN",
+            "BAKO_FIREBASE_WEB_APP_ID",
+            "BAKO_FIREBASE_REQUIRE_EMAIL_VERIFICATION",
+        ]
+        with patch.dict(sys.modules, {"streamlit": fake_streamlit}), patch.dict(
+            os.environ, {name: "" for name in names}, clear=False
+        ):
+            config = FirebaseAuthConfig.from_environment()
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.web_ready)
+        self.assertEqual(config.project_id, "bako-sweet")
 
     def test_unverified_identity_is_rejected(self):
         with self.assertRaises(FirebaseUnauthorizedError):
