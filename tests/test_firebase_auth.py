@@ -122,11 +122,23 @@ class FirebaseAuthTests(unittest.TestCase):
 
     def test_server_verifies_token_without_retaining_it(self):
         employee = employee_from_verified_claims(claims(role="viewer"), config=self.config)
-        with patch("utils.firebase_auth.auth.verify_id_token", return_value=claims(role="viewer")), patch(
+        with patch("utils.firebase_auth.auth.verify_id_token", return_value=claims(role="viewer")) as verifier, patch(
             "utils.firebase_auth.get_firebase_app", return_value=object()
         ):
             verified = verify_id_token("synthetic-token", config=self.config)
         self.assertEqual(verified.uid, employee.uid)
+        self.assertTrue(verifier.call_args.kwargs["check_revoked"])
+
+    def test_provider_permission_failure_is_safe_and_specific(self):
+        class PermissionDeniedError(RuntimeError):
+            code = "PERMISSION_DENIED"
+
+        with patch(
+            "utils.firebase_auth.auth.verify_id_token",
+            side_effect=PermissionDeniedError("credential details must not reach the UI"),
+        ), patch("utils.firebase_auth.get_firebase_app", return_value=object()):
+            with self.assertRaisesRegex(FirebaseUnauthorizedError, "not authorized"):
+                verify_id_token("synthetic-token", config=self.config)
 
     def test_snapshot_source_supports_verified_publication_identity(self):
         source = SnapshotSource(

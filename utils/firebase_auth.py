@@ -16,6 +16,7 @@ from functools import lru_cache
 from base64 import b64encode
 import hmac
 import hashlib
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -24,6 +25,9 @@ from typing import Any, Mapping
 from firebase_admin import auth, firestore
 
 from .firebase_admin_client import FIREBASE_PROJECT_ID, get_firebase_app, get_firestore_client, runtime_setting
+
+
+LOGGER = logging.getLogger("country_sweet.dashboard")
 
 
 AUTH_BOOTSTRAP_COLLECTION = "bako_sweet_auth_bootstrap"
@@ -211,7 +215,36 @@ def _verify_claims(id_token: str, *, check_revoked: bool) -> Mapping[str, Any]:
             check_revoked=check_revoked,
         )
     except Exception as exc:  # firebase_admin raises provider-specific exceptions
-        raise FirebaseUnauthorizedError("The Firebase sign-in session is invalid or revoked.") from exc
+        provider_type = type(exc).__name__
+        provider_code = getattr(exc, "code", "")
+        if not isinstance(provider_code, str) or len(provider_code) > 80:
+            provider_code = ""
+        # Keep diagnostics useful without writing token contents, credentials,
+        # email addresses, or provider response bodies to the server log.
+        LOGGER.warning(
+            "auth.token_provider_failure provider_type=%s provider_code=%s check_revoked=%s",
+            provider_type,
+            provider_code,
+            check_revoked,
+        )
+        failure_text = f"{provider_type} {provider_code}".casefold()
+        if "revoked" in failure_text:
+            message = "Firebase rejected this sign-in session because its token was revoked. Sign in again."
+        elif "disabled" in failure_text:
+            message = "This Firebase account is disabled. Contact an administrator."
+        elif any(marker in failure_text for marker in ("permission", "forbidden", "unauthenticated")):
+            message = (
+                "Firebase server authentication is not authorized for this deployment. "
+                "Check the deployed Firebase Admin credential and Authentication API access."
+            )
+        elif any(marker in failure_text for marker in ("certificate", "transport", "timeout", "deadline", "connection")):
+            message = (
+                "The deployed server could not reach Firebase's token-verification service. "
+                "Retry after checking the deployment's Firebase network and credential configuration."
+            )
+        else:
+            message = "The Firebase sign-in session is invalid or expired. Sign in again."
+        raise FirebaseUnauthorizedError(message) from exc
 
 
 def session_employee(session_state: Mapping[str, Any]) -> FirebaseEmployee | None:

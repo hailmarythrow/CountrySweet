@@ -156,6 +156,12 @@ LOGGER.info(
     DEV_SNAPSHOT_NAMESPACE,
     runtime_setting("FIREBASE_PROJECT_ID", "bako-sweet"),
 )
+LOGGER.info(
+    "auth.config required=%s enabled=%s email_verification=%s",
+    FIREBASE_AUTH_REQUIRED,
+    FIREBASE_AUTH_CONFIG.enabled,
+    FIREBASE_AUTH_CONFIG.require_email_verification,
+)
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -1378,6 +1384,12 @@ apply_theme(True, HEADER_IMAGE_PATH)
 # Deployment mode is fail-closed.  Streamlit Cloud does not execute the
 # Windows launcher, so this gate verifies the values supplied through Secrets
 # before any workbook, snapshot, or dashboard content is rendered.
+if ENABLE_DEV_FIRESTORE_SNAPSHOTS and not FIREBASE_AUTH_REQUIRED:
+    st.error(
+        "Shared Firebase snapshot mode requires mandatory Firebase Authentication. "
+        "Set BAKO_FIREBASE_AUTH_REQUIRED=true before exposing the dashboard."
+    )
+    st.stop()
 if FIREBASE_AUTH_REQUIRED:
     if not FIREBASE_AUTH_CONFIG.enabled:
         st.error(

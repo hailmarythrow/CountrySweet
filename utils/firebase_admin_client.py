@@ -23,25 +23,30 @@ class FirebaseAdminConfigurationError(RuntimeError):
 
 
 def runtime_setting(name: str, default: Any = "") -> Any:
-    """Read a setting with local environment variables taking precedence.
+    """Read a setting, preferring an explicitly configured Streamlit Secret.
 
-    Streamlit Cloud exposes ``st.secrets`` only inside the running app.  The
-    import is therefore deliberately lazy so this module remains usable by
-    local scripts and tests that do not initialize Streamlit.
+    Cloud Secrets must win over inherited process environment variables. This
+    prevents a stale ``BAKO_*`` value from a launcher or hosting environment
+    from silently overriding the deployment's security configuration. Outside
+    Streamlit (for example local scripts), environment variables remain the
+    normal configuration source.
     """
-    environment_value = os.getenv(name)
-    if environment_value is not None and str(environment_value).strip():
-        return environment_value
     try:
         import streamlit as st
 
         secrets = st.secrets
-        value = secrets.get(name, default)
-        return default if value is None else value
+        if name in secrets:
+            value = secrets[name]
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
     except Exception:
         # Missing secrets.toml and non-Streamlit callers are normal local
-        # states.  They must fall back to the documented default.
-        return default
+        # states. They fall through to the environment/default path below.
+        pass
+    environment_value = os.getenv(name)
+    if environment_value is not None and str(environment_value).strip():
+        return environment_value
+    return default
 
 
 def _configured_project_id() -> str:
@@ -84,6 +89,11 @@ def _streamlit_admin_credentials() -> dict[str, Any] | None:
         raise FirebaseAdminConfigurationError(
             "The Firebase Admin credential project does not match FIREBASE_PROJECT_ID."
         )
+    private_key = values.get("private_key")
+    if isinstance(private_key, str):
+        # TOML normally decodes ``\\n`` escapes for us.  Normalize a value
+        # pasted as a literal escaped JSON string as well, without logging it.
+        values["private_key"] = private_key.replace("\\r\\n", "\n").replace("\\n", "\n")
     return values
 
 

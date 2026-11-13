@@ -8,17 +8,24 @@ from utils import firebase_admin_client as client
 
 
 class FirebaseAdminConfigurationTests(unittest.TestCase):
-    def test_environment_takes_precedence_over_streamlit_secrets(self):
+    def test_streamlit_secrets_take_precedence_over_inherited_environment(self):
         fake_streamlit = types.SimpleNamespace(
-            secrets={"BAKO_FIREBASE_AUTH_ENABLED": False, "FIREBASE_PROJECT_ID": "wrong-project"}
+            secrets={"BAKO_FIREBASE_AUTH_REQUIRED": True, "FIREBASE_PROJECT_ID": "bako-sweet"}
         )
         with patch.dict(sys.modules, {"streamlit": fake_streamlit}), patch.dict(
             os.environ,
-            {"BAKO_FIREBASE_AUTH_ENABLED": "true", "FIREBASE_PROJECT_ID": "bako-sweet"},
+            {"BAKO_FIREBASE_AUTH_REQUIRED": "false", "FIREBASE_PROJECT_ID": "wrong-project"},
             clear=False,
         ):
-            self.assertEqual(client.runtime_setting("BAKO_FIREBASE_AUTH_ENABLED", "false"), "true")
+            self.assertTrue(client.runtime_setting("BAKO_FIREBASE_AUTH_REQUIRED", False))
             self.assertEqual(client.runtime_setting("FIREBASE_PROJECT_ID", "fallback"), "bako-sweet")
+
+    def test_environment_is_used_when_streamlit_secret_is_absent(self):
+        fake_streamlit = types.SimpleNamespace(secrets={})
+        with patch.dict(sys.modules, {"streamlit": fake_streamlit}), patch.dict(
+            os.environ, {"BAKO_FIREBASE_AUTH_REQUIRED": "true"}, clear=False
+        ):
+            self.assertEqual(client.runtime_setting("BAKO_FIREBASE_AUTH_REQUIRED", False), "true")
 
     def test_incomplete_streamlit_service_account_fails_closed(self):
         fake_streamlit = types.SimpleNamespace(
@@ -47,6 +54,24 @@ class FirebaseAdminConfigurationTests(unittest.TestCase):
         ):
             with self.assertRaises(client.FirebaseAdminConfigurationError):
                 client._streamlit_admin_credentials()
+
+    def test_literal_private_key_newlines_are_normalized(self):
+        fake_streamlit = types.SimpleNamespace(
+            secrets={
+                "firebase_admin": {
+                    "type": "service_account",
+                    "project_id": "bako-sweet",
+                    "private_key": "-----BEGIN PRIVATE KEY-----\\nsynthetic\\n-----END PRIVATE KEY-----\\n",
+                    "client_email": "synthetic@example.test",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            }
+        )
+        with patch.dict(sys.modules, {"streamlit": fake_streamlit}), patch.dict(
+            os.environ, {"FIREBASE_PROJECT_ID": "bako-sweet"}, clear=False
+        ):
+            values = client._streamlit_admin_credentials()
+        self.assertEqual(values["private_key"], "-----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY-----\n")
 
     def test_service_account_is_used_for_initialization(self):
         service_account = {
