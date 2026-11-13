@@ -154,6 +154,17 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div.st-key-upload_panel div[data-testid="stFileUploader"] button[aria-label*="Help"] {{ width: auto; min-height: 1rem; background: transparent !important; color: var(--cs-muted) !important; border: 0 !important; padding: 0; }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] button[aria-label*="Help"] p {{ color: var(--cs-muted) !important; font-size: 0 !important; }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] button[aria-label*="Help"] p::after {{ content: "?"; color: var(--cs-muted); font-size: .78rem; }}
+    div.st-key-workbook_ready_card div[data-testid="stButton"] > button {{ width: 100% !important; min-height: 49px !important; background: var(--cs-accent) !important; color: #091522 !important; border: 0 !important; border-radius: 9px !important; font-weight: 700 !important; transition: background-color .15s ease, box-shadow .15s ease; }}
+    div.st-key-workbook_ready_card div[data-testid="stButton"] > button:hover {{ background: #FF9455 !important; color: #091522 !important; }}
+    div.st-key-workbook_ready_card div[data-testid="stButton"] > button:focus-visible {{ background: #FF9455 !important; color: #091522 !important; box-shadow: 0 0 0 2px #07111B, 0 0 0 4px rgba(244,124,53,.75) !important; }}
+    div.st-key-workbook_ready_card div[data-testid="stButton"] > button p,
+    div.st-key-workbook_ready_card div[data-testid="stButton"] .stMarkdownEllipsis {{ color: #091522 !important; font-weight: 700 !important; white-space: normal !important; overflow: visible !important; text-overflow: clip !important; overflow-wrap: anywhere; line-height: 1.15; text-align: center; }}
+    div.st-key-workbook_ready_card .cs-workbook-refresh-time {{ color: #FFFFFF !important; font-size: .95rem; font-weight: 500; line-height: 1.35; margin: .15rem 0 .75rem; overflow-wrap: anywhere; }}
+    div.st-key-workbook_ready_card .cs-workbook-save-time {{ color: var(--cs-muted) !important; font-size: .82rem; font-weight: 400; line-height: 1.3; margin: -.45rem 0 .7rem; overflow-wrap: anywhere; }}
+    div.st-key-workbook_ready_card .cs-workbook-refresh-feedback {{ border-radius: .45rem; padding: .35rem .55rem; margin: -.1rem 0 .7rem; font-size: .78rem; line-height: 1.25; font-weight: 500; overflow-wrap: anywhere; }}
+    div.st-key-workbook_ready_card .cs-workbook-refresh-feedback--loading {{ color: #D8E2ED; background: rgba(185,199,213,.10); }}
+    div.st-key-workbook_ready_card .cs-workbook-refresh-feedback--success {{ color: #B9F3D7; background: rgba(66,165,131,.16); }}
+    div.st-key-workbook_ready_card .cs-workbook-refresh-feedback--error {{ color: #FFE4E6; background: rgba(220,80,86,.16); }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] small {{ display: none !important; }}
     div.st-key-upload_panel div[data-testid="stFileUploader"] label {{ display: none !important; }}
     div.st-key-upload_panel [data-testid="stFileUploaderFileData"] {{ color: var(--cs-text); }}
@@ -233,6 +244,33 @@ def apply_theme(dark: bool, header_image_path: Path | None = None) -> None:
     div.st-key-filters_panel div[data-baseweb="select"] > div {{ min-height: 2rem; }}
     div.st-key-filters_panel [data-testid="stButtonGroup"] {{ width: 100%; }}
     div.st-key-filters_panel [data-testid="stButtonGroup"] button {{ min-height: 2rem; white-space: nowrap; }}
+    /* X-Blocking reuses the dashboard's variety/size tile language while
+       keeping its existing multi-select behavior. */
+    div.st-key-x_blocking_filter_controls [data-testid="stHorizontalBlock"] {{ gap: .8rem; align-items: stretch !important; }}
+    div.st-key-x_filter_tile_variety, div.st-key-x_filter_tile_size {{
+        min-height: 112px; height: 100%; box-sizing: border-box; padding: 12px;
+        background: rgba(12, 24, 36, .72); border: 1px solid var(--cs-border); border-radius: 10px;
+    }}
+    div.st-key-x_filter_tile_variety {{ border-color: #39C982; }}
+    div.st-key-x_filter_tile_size {{ border-color: #38BDF8; }}
+    div.st-key-x_filter_tile_variety .cs-filter-control-label, div.st-key-x_filter_tile_size .cs-filter-control-label {{
+        display: flex; align-items: center; min-height: 30px; margin: 0 0 8px;
+        color: var(--cs-heading); font-size: 15px; font-weight: 600; line-height: 1.2; gap: 8px;
+    }}
+    div.st-key-x_filter_tile_variety .cs-filter-control-label .cs-inline-icon {{ color: #39C982; width: 26px; height: 26px; }}
+    div.st-key-x_filter_tile_size .cs-filter-control-label .cs-inline-icon {{ color: #38BDF8; width: 26px; height: 26px; }}
+    div.st-key-x_filter_tile_variety [data-baseweb="select"] > div, div.st-key-x_filter_tile_size [data-baseweb="select"] > div {{ min-height: 38px; }}
+    div.st-key-x_filter_tile_variety [data-baseweb="select"] span, div.st-key-x_filter_tile_size [data-baseweb="select"] span,
+    div.st-key-x_filter_tile_variety [data-baseweb="select"] input, div.st-key-x_filter_tile_size [data-baseweb="select"] input {{
+        color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important; font-size: 14px !important;
+    }}
+    div.st-key-x_filter_tile_variety [data-tag], div.st-key-x_filter_tile_size [data-tag] {{
+        background: #168A58 !important; border: 1px solid #39C982 !important; color: #FFFFFF !important;
+    }}
+    div.st-key-x_filter_tile_variety [data-tag] *, div.st-key-x_filter_tile_size [data-tag] * {{
+        color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important; opacity: 1 !important;
+    }}
+    div.st-key-x_filter_tile_variety [data-tag] svg, div.st-key-x_filter_tile_size [data-tag] svg {{ fill: none !important; stroke: #FFFFFF !important; }}
     div.st-key-inventory_panel {{ background: var(--cs-panel); border: 1px solid var(--cs-border); border-radius: .7rem; padding: .55rem .65rem .25rem; min-height: 23rem; }}
     div.st-key-mix_panel {{ background: var(--cs-panel); border: 1px solid var(--cs-border); border-radius: .7rem; padding: .55rem .65rem 25.8px; min-height: 0; }}
     div.st-key-inventory_panel h4 {{ margin: 0 0 .2rem; }}

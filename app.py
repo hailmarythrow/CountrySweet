@@ -5,8 +5,10 @@ from datetime import datetime
 from io import BytesIO
 import html
 import logging
+import os
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter, sleep, time as epoch_time
+from typing import Any
 from zoneinfo import ZoneInfo
 from zipfile import BadZipFile, ZipFile
 
@@ -30,7 +32,39 @@ from utils.charts import (
 from utils.excel_loader import REPORT_SCHEMA_VERSION, frame_for, load_inventory_workbook, normalize_frame, report_to_frame, timings_to_frame, workbook_content_id
 from utils.theme import apply_theme
 from utils.ui import render_chart, render_quality_summary, render_upload_error, render_upload_success, source_caption
-from utils.validation import apply_filters, options, source_period
+from utils.validation import apply_filters, options, source_period, standardized_dimension_options
+from utils.local_workbook_link import LocalWorkbookLink, choose_workbook, load_link, save_link
+from utils.dashboard_snapshot import (
+    DEFAULT_NAMESPACE as DEFAULT_DEV_SNAPSHOT_NAMESPACE,
+    DashboardSnapshotError,
+    SnapshotSource,
+    active_snapshot_version,
+    publish_dashboard_snapshot,
+    read_snapshot_refresh_metadata,
+    record_snapshot_refresh,
+    restore_dashboard_snapshot,
+)
+from utils.firebase_auth import (
+    FirebaseAuthConfig,
+    FirebaseAuthError,
+    FirebaseEmployee,
+    approve_new_account,
+    cancel_invitation,
+    clear_auth_session,
+    invitation_digest,
+    invite_teammate,
+    list_invitations,
+    list_team_members,
+    remember_employee,
+    normalize_person_name,
+    revoke_user,
+    render_firebase_auth_component,
+    require_permission,
+    session_employee,
+    token_digest,
+    validate_invitation,
+    verify_id_token,
+)
 from utils.x_blocking import (
     build_comparison,
     build_organic_outlook,
@@ -74,9 +108,21 @@ DEFAULT_LOCATION = {
     "latitude": 35.3733,
     "longitude": -119.0187,
 }
-# Manual refresh remains implemented for a future persistent OneDrive,
-# SharePoint, or local connection, but is temporarily disabled in the UI.
-ENABLE_WORKBOOK_REFRESH = False
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+# Development-only local OneDrive-sync demonstration. This is deliberately
+# opt-in and does not activate Graph or Country Sweet employee authentication.
+ENABLE_LOCAL_WORKBOOK_DEMO = _env_flag("BAKO_LOCAL_WORKBOOK_DEMO", False)
+# Development-only persistence is opt-in and never uses the production active
+# workbook metadata pointer. It stores dashboard-ready frames only.
+ENABLE_DEV_FIRESTORE_SNAPSHOTS = _env_flag("BAKO_DEV_FIRESTORE_SNAPSHOTS", False)
+DEV_SNAPSHOT_NAMESPACE = os.getenv("BAKO_DEV_FIRESTORE_SNAPSHOT_NAMESPACE", DEFAULT_DEV_SNAPSHOT_NAMESPACE).strip() or DEFAULT_DEV_SNAPSHOT_NAMESPACE
+FIREBASE_AUTH_CONFIG = FirebaseAuthConfig.from_environment()
+# This panel is a separate local-development aid for verifying an existing
+# Firebase account. It never grants dashboard access and is off by default.
+FIREBASE_AUTH_DEV_PANEL = _env_flag("BAKO_FIREBASE_AUTH_DEV_PANEL", False)
 # Keep parser diagnostics and timing calculations active, but hide the
 # technical worksheet report from the normal Executive Overview interface.
 SHOW_TECHNICAL_VALIDATION_DETAILS = False
@@ -99,6 +145,13 @@ SHOW_PURCHASING_LOADS = False
 X_BLOCKING_SCENARIO_QUANTITY_KEY = "x_blocking_scenario_quantity"
 X_BLOCKING_SCENARIO_SLIDER_KEY = "x_blocking_scenario_slider"
 X_BLOCKING_SCENARIO_EXACT_KEY = "x_blocking_scenario_exact"
+LOGGER.info(
+    "snapshot.config app_path=%s enabled=%s namespace=%s firebase_project=%s",
+    Path(__file__).resolve(),
+    ENABLE_DEV_FIRESTORE_SNAPSHOTS,
+    DEV_SNAPSHOT_NAMESPACE,
+    os.getenv("FIREBASE_PROJECT_ID", "bako-sweet"),
+)
 WEATHER_CODES = {
     0: ("Clear sky", "☀️"), 1: ("Mainly clear", "🌤️"), 2: ("Partly cloudy", "⛅"),
     3: ("Overcast", "☁️"), 45: ("Fog", "🌫️"), 48: ("Rime fog", "🌫️"),
@@ -467,6 +520,41 @@ def _timestamp_label(value: object) -> str:
         return str(value)
 
 
+def _refresh_first_name(employee: FirebaseEmployee | None) -> str | None:
+    """Return a trusted profile first name without inferring from email."""
+    if employee is None:
+        return None
+    if employee.first_name:
+        return employee.first_name
+    display_name = str(employee.display_name or "").strip()
+    if not display_name or display_name.casefold() == employee.email.casefold():
+        return None
+    first_name = display_name.split()[0].strip(" ,.;:()[]{}")
+    return first_name or None
+
+
+def _pacific_timestamp_label(value: object) -> str:
+    if not value:
+        return "Not available"
+    try:
+        return datetime.fromisoformat(str(value)).astimezone(ZoneInfo("America/Los_Angeles")).strftime(
+            "%b %d, %Y %I:%M:%S %p %Z"
+        )
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_snapshot_publication_identity() -> None:
+    """Show persisted publisher metadata without changing it on reads."""
+    if not ENABLE_DEV_FIRESTORE_SNAPSHOTS:
+        return
+    publisher_name = st.session_state.get("dev_snapshot_publisher_name")
+    published_at = st.session_state.get("dev_snapshot_published_at")
+    if publisher_name and published_at:
+        st.caption(f"Last refreshed by: **{publisher_name}**")
+        st.caption(f"Last refreshed: {_pacific_timestamp_label(published_at)}")
+
+
 def _activate_workbook(
     report,
     *,
@@ -495,6 +583,11 @@ def _activate_workbook(
         if file_stat is not None
         else ""
     )
+    # A newly validated upload/local refresh starts a fresh status cycle; a
+    # previous Firebase reload message must not linger on the replacement.
+    st.session_state.workbook_refresh_status = ""
+    st.session_state.workbook_refresh_error = ""
+    st.session_state.pop("workbook_refresh_just_completed", None)
     st.session_state.active_workbook_error = ""
     st.session_state.active_workbook_stale = False
 
@@ -521,6 +614,282 @@ def verified_record_count(frame: pd.DataFrame) -> int:
     return int(frame.loc[frame["product"].notna() & frame[measures].notna().any(axis=1)].shape[0])
 
 
+def _excel_upload_icon_markup() -> str:
+    return (
+        "<svg class='cs-excel-upload-icon' width='58' height='64' viewBox='0 0 58 64' "
+        "aria-hidden='true'><path d='M8 2h29l13 13v47H8z' fill='#187C56'/>"
+        "<path d='M37 2v13h13' fill='#0F6848'/><path d='M37 2 50 15H37z' fill='#5AB68D'/>"
+        "<rect x='16' y='23' width='26' height='20' rx='1.5' fill='#F1FBF6'/>"
+        "<path d='M16 29.7h26M16 36.4h26M24.7 23v20M33.4 23v20' fill='none' stroke='#187C56' stroke-width='1.5'/>"
+        "<text x='29' y='56.5' text-anchor='middle' fill='#F1FBF6' font-family='Arial, sans-serif' font-size='7' font-weight='700' letter-spacing='.5'>XLSX</text></svg>"
+    )
+
+
+def _render_workbook_ready_card() -> None:
+    """Render the compact ready state for an active validated workbook."""
+    source_type = st.session_state.get("active_workbook_source_type")
+    restored = source_type == "firestore_snapshot"
+    source_label = "Restored from Firebase" if restored else "Loaded and validated"
+    with st.container(key="workbook_ready_card"):
+        with st.expander(f"✅ Workbook Ready  ·  {source_label}", expanded=True):
+            filename = st.session_state.get("active_workbook_name") or "Workbook filename unavailable"
+            refreshed_at = st.session_state.get("active_workbook_last_refresh")
+            refreshed_by = str(st.session_state.get("active_workbook_last_refreshed_by") or "").strip()
+            saved_at = st.session_state.get("active_workbook_last_saved")
+            st.markdown(
+                "<div class='cs-upload-feedback cs-upload-feedback--success'>"
+                "<div class='cs-upload-feedback-icon'>✓</div>"
+                "<div class='cs-upload-feedback-copy'>"
+                "<div class='cs-upload-feedback-title'>Workbook is supplying the dashboard</div>"
+                f"<div class='cs-upload-feedback-file'>{html.escape(str(filename))}</div>"
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+            refresh_identity_markup = (
+                f"<div class='cs-workbook-refresh-time'>Last refreshed by {html.escape(refreshed_by)}</div>"
+                if refreshed_by.casefold() not in {"", "team member"}
+                else "<div class='cs-workbook-refresh-time'>Last refreshed</div>"
+            )
+            st.markdown(
+                refresh_identity_markup
+                + f"<div class='cs-workbook-refresh-time'>{html.escape(_timestamp_label(refreshed_at))}</div>"
+                f"<div class='cs-workbook-save-time'>Last saved: "
+                f"{html.escape(_timestamp_label(saved_at))}</div>",
+                unsafe_allow_html=True,
+            )
+            refresh_status = st.session_state.get("workbook_refresh_status")
+            refresh_just_completed = bool(st.session_state.pop("workbook_refresh_just_completed", False))
+            if refresh_just_completed and refresh_status not in {"success", "error"}:
+                # Preserve the visible confirmation even if another safe
+                # restore path cleared the transient status during rerun.
+                refresh_status = "success"
+            if refresh_status == "refreshing":
+                st.markdown(
+                    "<div class='cs-workbook-refresh-feedback cs-workbook-refresh-feedback--loading'>Refreshing...</div>",
+                    unsafe_allow_html=True,
+                )
+            elif refresh_status == "success":
+                st.markdown(
+                    "<div class='cs-workbook-refresh-feedback cs-workbook-refresh-feedback--success'>Refresh successful.</div>",
+                    unsafe_allow_html=True,
+                )
+            elif refresh_status == "error":
+                st.markdown(
+                    "<div class='cs-workbook-refresh-feedback cs-workbook-refresh-feedback--error'>"
+                    "Refresh failed. The previous validated workbook remains active.</div>",
+                    unsafe_allow_html=True,
+                )
+            action_columns = st.columns(2 if restored else 1, gap="small")
+            if restored:
+                with action_columns[0]:
+                    if st.button("Refresh Workbook", key="reload_saved_dashboard_data", width="stretch"):
+                        st.session_state.reload_saved_data_requested = True
+                        st.session_state.workbook_refresh_status = "refreshing"
+                        st.rerun()
+            replace_column = action_columns[-1]
+            with replace_column:
+                if st.button("Replace Workbook", key="replace_active_workbook", width="stretch"):
+                    st.session_state.workbook_replace_open = True
+                    st.rerun()
+        # Keep this interaction entirely in the browser.  It changes only the
+        # native expander's open state, so scrolling never reruns Streamlit or
+        # touches workbook/Firebase state.
+        st.html(
+            """
+            <script>
+            (() => {
+                const card = document.querySelector("div.st-key-workbook_ready_card");
+                const details = card && card.querySelector("details");
+                if (!card || !details) return;
+
+                const cleanupKey = "__csWorkbookReadyScrollCleanup";
+                if (typeof window[cleanupKey] === "function") window[cleanupKey]();
+
+                const scrollTarget = document.querySelector("main.stMain") || window;
+                const animationStart = 0;
+                const animationEnd = 260;
+                const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+                let framePending = false;
+                const detailsContent = details.querySelector('[data-testid="stExpanderDetails"]');
+                if (!detailsContent) return;
+
+                const getScrollPosition = () => scrollTarget === window
+                    ? (window.scrollY || document.documentElement.scrollTop || 0)
+                    : scrollTarget.scrollTop;
+                // A refresh confirmation is inserted by a Streamlit rerun. On
+                // that first frame, reveal the current natural height so the
+                // new message cannot leave the action row clipped. Subsequent
+                // scroll events immediately resume the normal interpolation.
+                let revealAfterRefresh = Boolean(card.querySelector(".cs-workbook-refresh-feedback"));
+
+                // Keep the native expander open so its header remains stable;
+                // the details region itself is scroll-linked below.
+                details.open = true;
+                detailsContent.style.overflow = "hidden";
+                detailsContent.style.willChange = "max-height, opacity";
+                const measureExpandedHeight = () => {
+                    const previousMaxHeight = detailsContent.style.maxHeight;
+                    detailsContent.style.maxHeight = "none";
+                    const naturalHeight = detailsContent.scrollHeight;
+                    detailsContent.style.maxHeight = previousMaxHeight;
+                    return naturalHeight;
+                };
+                let expandedHeight = measureExpandedHeight();
+
+                const syncToScrollPosition = () => {
+                    const scrollTop = getScrollPosition();
+                    const rawProgress = 1 - ((scrollTop - animationStart) / (animationEnd - animationStart));
+                    const progress = revealAfterRefresh
+                        ? 1
+                        : reducedMotion
+                        ? (scrollTop <= animationStart ? 1 : 0)
+                        : Math.max(0, Math.min(1, rawProgress));
+                    revealAfterRefresh = false;
+                    const eased = progress * progress * (3 - (2 * progress));
+                    details.open = true;
+                    detailsContent.style.maxHeight = `${Math.round(expandedHeight * eased)}px`;
+                    detailsContent.style.opacity = `${eased}`;
+                    detailsContent.style.pointerEvents = eased < 0.05 ? "none" : "";
+                    detailsContent.setAttribute("aria-hidden", eased < 0.05 ? "true" : "false");
+                    card.dataset.csWorkbookReadyState = progress <= 0 ? "collapsed" : progress >= 1 ? "expanded" : "transitioning";
+                };
+
+                const onResize = () => {
+                    expandedHeight = measureExpandedHeight();
+                    syncToScrollPosition();
+                };
+                let observerFramePending = false;
+                const resizeObserver = typeof ResizeObserver === "function"
+                    ? new ResizeObserver(() => {
+                        if (observerFramePending) return;
+                        observerFramePending = true;
+                        window.requestAnimationFrame(() => {
+                            observerFramePending = false;
+                            revealAfterRefresh = true;
+                            onResize();
+                        });
+                    })
+                    : null;
+                if (resizeObserver) {
+                    // The inner block changes size when Streamlit inserts or
+                    // removes status content; observing the constrained
+                    // wrapper alone would not see those changes.
+                    if (detailsContent.firstElementChild) {
+                        resizeObserver.observe(detailsContent.firstElementChild);
+                    }
+                }
+
+                const onScroll = () => {
+                    if (framePending) return;
+                    framePending = true;
+                    window.requestAnimationFrame(() => {
+                        framePending = false;
+                        syncToScrollPosition();
+                    });
+                };
+
+                scrollTarget.addEventListener("scroll", onScroll, { passive: true });
+                window.addEventListener("resize", onResize, { passive: true });
+                window[cleanupKey] = () => {
+                    scrollTarget.removeEventListener("scroll", onScroll);
+                    window.removeEventListener("resize", onResize);
+                    if (resizeObserver) resizeObserver.disconnect();
+                    if (window[cleanupKey]) delete window[cleanupKey];
+                };
+                syncToScrollPosition();
+            })();
+            </script>
+            """,
+            unsafe_allow_javascript=True,
+        )
+
+
+def _render_workbook_upload_panel(slot: object) -> tuple[object | None, object]:
+    """Render the ready card or the existing native upload workflow.
+
+    The keyed outer container stays mounted while ``content_slot`` can be
+    replaced after restoration or validation in the same Streamlit run. This
+    keeps the upload widget stable without forcing a rerun after file upload.
+    """
+    current_name = st.session_state.get("active_workbook_name")
+    current_source = st.session_state.get("active_workbook_source_type")
+    replace_open = bool(st.session_state.get("workbook_replace_open", False))
+    with slot.container():
+        with st.container(key="upload_panel"):
+            content_slot = st.empty()
+            active_source = current_source if current_source in {"upload", "local_link", "firestore_snapshot"} else None
+            has_active_workbook = (
+                bool(current_name)
+                and active_source is not None
+                and st.session_state.get("active_workbook_report") is not None
+                and not st.session_state.get("active_workbook_stale", False)
+            )
+            if has_active_workbook and not replace_open:
+                with content_slot.container():
+                    _render_workbook_ready_card()
+                return None, content_slot
+            with content_slot.container():
+                upload_state_class = "cs-upload-state--replace" if current_name else "cs-upload-state--choose"
+                heading = "Replace Inventory Workbook" if current_name else "Upload Inventory Workbook"
+                excel_upload_icon = _excel_upload_icon_markup()
+                st.markdown(
+                    "<div class='cs-upload-intro'>"
+                    f"<div class='cs-upload-icon-wrap'>{excel_upload_icon}</div>"
+                    "<div class='cs-upload-copy'>"
+                    f"<div class='cs-upload-heading'>{heading}</div>"
+                    "<div class='cs-upload-subtitle'>Drag and drop your Excel file here, or click to browse.</div>"
+                    "<div class='cs-upload-support'>Supports .xlsx files (200MB per file)</div>"
+                    "</div></div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"<span class='cs-upload-state {upload_state_class}' aria-hidden='true'></span>", unsafe_allow_html=True)
+                uploaded = st.file_uploader(
+                    "Choose Excel File",
+                    type=["xlsx"],
+                    key="workbook_uploader",
+                    help="A browser upload is a validated snapshot. Replace it here when you have a newer workbook version.",
+                    label_visibility="collapsed",
+                    disabled=(
+                        FIREBASE_AUTH_CONFIG.enabled
+                        and not (
+                            session_employee(st.session_state)
+                            and session_employee(st.session_state).can("publish_workbook")
+                        )
+                    ),
+                )
+                if current_name:
+                    st.caption("The current validated workbook remains active until the replacement succeeds.")
+                if ENABLE_LOCAL_WORKBOOK_DEMO:
+                    linked = load_link()
+                    if linked:
+                        st.caption(f"Local synced workbook: **{linked.filename}**")
+                    picker_col, refresh_col = st.columns(2, gap="small")
+                    with picker_col:
+                        if st.button("Select synced workbook", key="select_local_workbook"):
+                            try:
+                                selected_path = choose_workbook()
+                                if selected_path is not None:
+                                    save_link(
+                                        LocalWorkbookLink(
+                                            path=str(selected_path),
+                                            filename=selected_path.name,
+                                            selected_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                                        )
+                                    )
+                                    st.session_state.active_workbook_path = str(selected_path)
+                                    st.session_state.local_link_pending = True
+                                    st.session_state.local_link_picker_error = ""
+                            except Exception as exc:
+                                st.session_state.local_link_picker_error = str(exc)
+                    with refresh_col:
+                        if st.button("Refresh synced workbook", key="refresh_local_workbook"):
+                            st.session_state.local_refresh_requested = True
+                    picker_error = st.session_state.get("local_link_picker_error")
+                    if picker_error:
+                        st.warning(picker_error)
+            return uploaded, content_slot
+
+
 def dashboard_icon(name: str, *, size: int = 24) -> str:
     """Return one consistent inline outline icon for the presentation layer."""
     paths = {
@@ -539,7 +908,7 @@ def dashboard_icon(name: str, *, size: int = 24) -> str:
     return f'<svg class="cs-inline-icon" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{path}</svg>'
 
 
-def render_sidebar_navigation(page_names: list[str]) -> str:
+def render_sidebar_navigation(page_names: list[str], *, firebase_employee: FirebaseEmployee | None = None) -> str:
     """Render compact native buttons in the expanded sidebar."""
     icons = {
         "Executive Overview": ":material/dashboard:",
@@ -584,6 +953,17 @@ def render_sidebar_navigation(page_names: list[str]) -> str:
                 on_click=lambda: st.session_state.update(sidebar_page="Settings"),
             ):
                 current = "Settings"
+            if firebase_employee is not None:
+                with st.expander(":material/account_circle: My Account · :green[●]", expanded=False):
+                    if firebase_employee.display_name and firebase_employee.display_name != firebase_employee.email:
+                        st.caption(firebase_employee.display_name)
+                    st.text(firebase_employee.email)
+                    st.caption(f"Role: {firebase_employee.role.title()}")
+                    st.caption("✓ Email verified")
+                    if st.button("Sign out", key="firebase_sign_out", width="stretch"):
+                        clear_auth_session(st.session_state)
+                        st.session_state.firebase_force_signout = True
+                        st.rerun()
     return current
 
 
@@ -660,34 +1040,42 @@ def render_inventory_mix_legend(frame: pd.DataFrame) -> None:
     st.markdown("<div class='cs-mix-legend'>" + "".join(rows) + "</div>", unsafe_allow_html=True)
 
 
-OPEN_METEO_TIMEOUT_SECONDS = 8
+OPEN_METEO_TIMEOUT_SECONDS = 4
+OPEN_METEO_ATTEMPTS = 2
 OPEN_METEO_CACHE_SECONDS = 900
+WEATHER_STALE_SECONDS = 21600
 
 
 def _open_meteo_get(endpoint: str, *, params: dict[str, object], operation: str) -> requests.Response:
     """Call Open-Meteo directly so stale process proxy settings cannot break weather."""
     started = perf_counter()
-    session = requests.Session()
-    # The dashboard calls a public HTTPS endpoint. Ignoring inherited proxy
-    # variables avoids stale local proxy settings such as 127.0.0.1:9 while
-    # leaving the rest of the application's HTTP behavior unchanged.
-    session.trust_env = False
-    try:
-        response = session.get(endpoint, params=params, timeout=OPEN_METEO_TIMEOUT_SECONDS)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        LOGGER.warning(
-            "weather.%s failed endpoint=%s elapsed_ms=%.1f error=%s",
-            operation, endpoint, (perf_counter() - started) * 1000, exc,
-        )
-        raise
-    finally:
-        session.close()
-    LOGGER.info(
-        "weather.%s succeeded status=%s elapsed_ms=%.1f",
-        operation, response.status_code, (perf_counter() - started) * 1000,
-    )
-    return response
+    last_error: requests.RequestException | None = None
+    for attempt in range(1, OPEN_METEO_ATTEMPTS + 1):
+        session = requests.Session()
+        # The dashboard calls a public HTTPS endpoint. Ignoring inherited
+        # proxy variables avoids stale local proxy settings such as 127.0.0.1:9
+        # while leaving the rest of the application's HTTP behavior unchanged.
+        session.trust_env = False
+        try:
+            response = session.get(endpoint, params=params, timeout=OPEN_METEO_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            LOGGER.info(
+                "weather.%s succeeded status=%s attempt=%s elapsed_ms=%.1f",
+                operation, response.status_code, attempt, (perf_counter() - started) * 1000,
+            )
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            LOGGER.warning(
+                "weather.%s failed endpoint=%s attempt=%s elapsed_ms=%.1f error=%s",
+                operation, endpoint, attempt, (perf_counter() - started) * 1000, exc,
+            )
+            if attempt < OPEN_METEO_ATTEMPTS:
+                sleep(0.25)
+        finally:
+            session.close()
+    assert last_error is not None
+    raise last_error
 
 
 @st.cache_data(ttl=OPEN_METEO_CACHE_SECONDS, show_spinner=False)
@@ -823,11 +1211,40 @@ def _get_weather_cached(latitude: float, longitude: float, temperature_unit: str
 
 
 def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahrenheit") -> dict:
-    """Return cached successful conditions; failed requests are retried later."""
+    """Return live conditions, or a recent successful result when the provider is unavailable."""
+    temperature_unit = "celsius" if temperature_unit == "celsius" else "fahrenheit"
+    cache_key = (round(float(latitude), 4), round(float(longitude), 4))
     try:
-        return _get_weather_cached(float(latitude), float(longitude), temperature_unit)
+        weather = dict(_get_weather_cached(float(latitude), float(longitude), temperature_unit))
+        weather["is_cached"] = False
+        st.session_state.setdefault("weather_last_success", {})[cache_key] = {
+            "weather": dict(weather),
+            "saved_at": epoch_time(),
+        }
+        return weather
     except (requests.RequestException, ValueError, TypeError) as exc:
         LOGGER.warning("weather.forecast_parse_failed latitude=%s longitude=%s error=%s", latitude, longitude, exc)
+        recent = st.session_state.get("weather_last_success", {}).get(cache_key)
+        if isinstance(recent, dict):
+            age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
+            if age <= WEATHER_STALE_SECONDS and isinstance(recent.get("weather"), dict):
+                stale = dict(recent["weather"])
+                source_unit = stale.get("temperature_unit", "fahrenheit")
+                if source_unit != temperature_unit:
+                    source_temperature = float(stale["temperature"])
+                    stale["temperature"] = (
+                        (source_temperature - 32.0) * 5.0 / 9.0
+                        if temperature_unit == "celsius"
+                        else source_temperature * 9.0 / 5.0 + 32.0
+                    )
+                    stale["temperature_unit"] = temperature_unit
+                stale["is_cached"] = True
+                stale["cache_age_seconds"] = age
+                LOGGER.info(
+                    "weather.forecast_using_cached latitude=%s longitude=%s age_seconds=%.0f",
+                    latitude, longitude, age,
+                )
+                return stale
         raise
 
 
@@ -850,8 +1267,8 @@ def apply_weather_unit_preference() -> None:
     st.session_state.weather_unit = "celsius" if selected == "Celsius" else "fahrenheit"
 
 
-def render_top_header() -> object | None:
-    """Render the compact header, weather card, and the single workbook uploader."""
+def render_top_header() -> tuple[object | None, object]:
+    """Render the compact header, weather card, and workbook status/uploader."""
     greeting, date, clock = get_welcome(st.session_state.timezone)
     if "weather_location" not in st.session_state:
         st.session_state.weather_location = DEFAULT_LOCATION.copy()
@@ -916,13 +1333,16 @@ def render_top_header() -> object | None:
                         st.session_state.weather_unit,
                     )
                     unit_label = "°C" if st.session_state.weather_unit == "celsius" else "°F"
+                    condition_label = html.escape(str(weather["condition"]))
+                    if weather.get("is_cached"):
+                        condition_label = f"Cached · {condition_label}"
                     weather_markup = (
                         "<div class='cs-weather-widget'>"
                         f"<div class='cs-weather-icon'>{weather_icon_svg(weather.get('weather_code'), weather.get('is_day', True))}</div>"
                         "<div class='cs-weather-info'>"
                         f"<div class='cs-weather-location'>{html.escape(location_label(selected_location))}</div>"
                         f"<div class='cs-weather-temperature'>{weather['temperature']:.0f} {unit_label}</div>"
-                        f"<div class='cs-weather-condition'>{html.escape(weather['condition'])}</div>"
+                        f"<div class='cs-weather-condition'>{condition_label}</div>"
                         "</div></div>"
                     )
                     st.markdown(weather_markup, unsafe_allow_html=True)
@@ -937,40 +1357,9 @@ def render_top_header() -> object | None:
                         "</div></div>",
                         unsafe_allow_html=True,
                     )
-                current_name = st.session_state.get("active_workbook_name")
-                upload_state_class = "cs-upload-state--replace" if current_name else "cs-upload-state--choose"
-                excel_upload_icon = (
-                    "<svg class='cs-excel-upload-icon' width='58' height='64' viewBox='0 0 58 64' "
-                    "aria-hidden='true'><path d='M8 2h29l13 13v47H8z' fill='#187C56'/>"
-                    "<path d='M37 2v13h13' fill='#0F6848'/><path d='M37 2 50 15H37z' fill='#5AB68D'/>"
-                    "<rect x='16' y='23' width='26' height='20' rx='1.5' fill='#F1FBF6'/>"
-                    "<path d='M16 29.7h26M16 36.4h26M24.7 23v20M33.4 23v20' fill='none' stroke='#187C56' stroke-width='1.5'/>"
-                    "<text x='29' y='56.5' text-anchor='middle' fill='#F1FBF6' font-family='Arial, sans-serif' font-size='7' font-weight='700' letter-spacing='.5'>XLSX</text></svg>"
-                )
-                with st.container(key="upload_panel"):
-                    st.markdown(
-                        "<div class='cs-upload-intro'>"
-                        f"<div class='cs-upload-icon-wrap'>{excel_upload_icon}</div>"
-                        "<div class='cs-upload-copy'>"
-                        "<div class='cs-upload-heading'>Upload Inventory Workbook</div>"
-                        "<div class='cs-upload-subtitle'>Drag and drop your Excel file here, or click to browse.</div>"
-                        "<div class='cs-upload-support'>Supports .xlsx files (200MB per file)</div>"
-                        "</div></div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(f"<span class='cs-upload-state {upload_state_class}' aria-hidden='true'></span>", unsafe_allow_html=True)
-                    uploaded = st.file_uploader(
-                        "Choose Excel File",
-                        type=["xlsx"],
-                        key="workbook_uploader",
-                        help="A browser upload is a validated snapshot. Replace it here when you have a newer workbook version.",
-                        label_visibility="collapsed",
-                    )
-                    if current_name:
-                        st.caption(f"Current workbook: **{current_name}**")
-                        st.caption(f"Last successful refresh: {_timestamp_label(st.session_state.get('active_workbook_last_refresh'))}")
-                    return uploaded
-    return None
+                upload_panel_slot = st.empty()
+                uploaded, upload_content_slot = _render_workbook_upload_panel(upload_panel_slot)
+    return uploaded, upload_content_slot
 
 
 if "dark_mode" not in st.session_state:
@@ -981,14 +1370,324 @@ if "timezone" not in st.session_state:
     st.session_state.timezone = "America/Los_Angeles"
 
 apply_theme(True, HEADER_IMAGE_PATH)
+
+# Optional verification-only panel. It intentionally runs while mandatory
+# authentication is disabled, so an existing Firebase user can request the
+# official verification email without assigning a role or locking the local
+# dashboard behind a login screen.
+if FIREBASE_AUTH_DEV_PANEL and not FIREBASE_AUTH_CONFIG.enabled:
+    if not FIREBASE_AUTH_CONFIG.web_ready:
+        st.sidebar.warning(
+            "Firebase verification panel is enabled, but the local Web App configuration "
+            "is incomplete. Set BAKO_FIREBASE_WEB_API_KEY, BAKO_FIREBASE_AUTH_DOMAIN, "
+            "and BAKO_FIREBASE_WEB_APP_ID."
+        )
+    else:
+        with st.sidebar.expander("Firebase account verification (development)", expanded=True):
+            st.caption(
+                "Verification only. Dashboard login remains disabled; no role or administrator "
+                "claim is assigned here."
+            )
+            render_firebase_auth_component(FIREBASE_AUTH_CONFIG, verification_only=True)
+
+# Firebase authentication is deliberately opt-in. When enabled, this gate is
+# evaluated before any workbook, snapshot, or dashboard data is rendered.
+firebase_employee: FirebaseEmployee | None = None
+auth_panel_slot = None
+if FIREBASE_AUTH_CONFIG.enabled:
+    if not FIREBASE_AUTH_CONFIG.web_ready:
+        st.error(
+            "Firebase Authentication is enabled, but its web configuration is incomplete. "
+            "Ask the project administrator to configure the Firebase web app settings."
+        )
+        st.stop()
+    # Do not render the full auth component once a verified session exists.
+    # Removing it from the Streamlit tree prevents the login form from
+    # occupying space or reappearing during ordinary reruns/tab navigation.
+    firebase_employee = session_employee(st.session_state)
+    auth_event: dict[str, Any] = {}
+    if firebase_employee is None:
+        signup_approval = st.session_state.get("firebase_signup_approval")
+        signup_approval_active = isinstance(signup_approval, dict)
+        signup_profile = st.session_state.get("firebase_signup_profile")
+        force_signout = bool(st.session_state.pop("firebase_force_signout", False))
+        auth_panel_slot = st.empty()
+        with auth_panel_slot.container():
+            with st.container(horizontal_alignment="center"):
+                auth_event = render_firebase_auth_component(
+                    FIREBASE_AUTH_CONFIG,
+                    signup_approved=signup_approval_active,
+                    signup_profile=signup_profile if isinstance(signup_profile, dict) else None,
+                    signup_error=str(st.session_state.get("firebase_signup_error", "")),
+                    force_signout=force_signout,
+                )
+    signup_request = auth_event.get("signup_request")
+    if isinstance(signup_request, dict):
+        request_email = str(signup_request.get("email", "")).strip().casefold()
+        request_code = str(signup_request.get("invite_code", "")).strip()
+        try:
+            request_first_name = normalize_person_name(
+                str(signup_request.get("first_name", "")),
+                field_name="First name",
+            )
+            request_last_name = normalize_person_name(
+                str(signup_request.get("last_name", "")),
+                field_name="Last name",
+            )
+        except FirebaseAuthError as exc:
+            st.session_state.firebase_signup_error = str(exc)
+            st.rerun()
+        request_digest = invitation_digest(request_code)
+        prior_request = st.session_state.get("firebase_last_signup_request")
+        approval_matches = (
+            isinstance(signup_approval, dict)
+            and signup_approval.get("email") == request_email
+            and signup_approval.get("invite_digest") == request_digest
+        )
+        if not approval_matches and prior_request != request_digest:
+            st.session_state.pop("firebase_signup_error", None)
+            try:
+                invitation = validate_invitation(request_email, request_code)
+                if invitation is None:
+                    raise FirebaseAuthError("That invitation is invalid, expired, or already used.")
+                st.session_state.firebase_signup_approval = {
+                    "email": request_email,
+                    "invite_digest": request_digest,
+                }
+                st.session_state.firebase_signup_profile = {
+                    "first_name": request_first_name,
+                    "last_name": request_last_name,
+                }
+                st.session_state.firebase_last_signup_request = request_digest
+                st.rerun()
+            except FirebaseAuthError as exc:
+                st.session_state.firebase_last_signup_request = request_digest
+                st.session_state.firebase_signup_error = str(exc)
+                st.rerun()
+    signup_result = auth_event.get("signup_result")
+    if isinstance(signup_result, dict):
+        signup_token = str(signup_result.get("id_token", "")).strip()
+        signup_code = str(signup_result.get("invite_code", "")).strip()
+        result_digest = token_digest(signup_token) if signup_token else ""
+        if result_digest and result_digest == st.session_state.get("firebase_last_signup_result"):
+            signup_result = None
+        else:
+            if result_digest:
+                st.session_state.firebase_last_signup_result = result_digest
+    if isinstance(signup_result, dict):
+        approval = st.session_state.get("firebase_signup_approval")
+        profile = st.session_state.get("firebase_signup_profile")
+        if not signup_token or not signup_code or not isinstance(approval, dict) or not isinstance(profile, dict) or invitation_digest(signup_code) != approval.get("invite_digest"):
+            st.session_state.pop("firebase_signup_approval", None)
+            st.session_state.firebase_signup_error = "The invitation approval expired. Start registration again with a valid invitation."
+            st.rerun()
+        try:
+            approve_new_account(
+                signup_token,
+                signup_code,
+                first_name=str(profile.get("first_name", "")),
+                last_name=str(profile.get("last_name", "")),
+                config=FIREBASE_AUTH_CONFIG,
+            )
+            st.session_state.pop("firebase_signup_approval", None)
+            st.session_state.pop("firebase_signup_profile", None)
+            st.session_state.pop("firebase_signup_error", None)
+            st.info("Account created. Verify your Firebase email, then sign in.")
+            st.stop()
+        except FirebaseAuthError as exc:
+            # Keep the same approval/profile in session so a profile or role
+            # update failure can be retried for the existing Firebase UID
+            # without creating another account.
+            st.session_state.pop("firebase_last_signup_result", None)
+            st.session_state.firebase_signup_error = str(exc)
+            st.rerun()
+    if auth_event.get("logout"):
+        clear_auth_session(st.session_state)
+    token = auth_event.get("id_token")
+    if token:
+        auth_started = perf_counter()
+        try:
+            firebase_employee = verify_id_token(str(token), config=FIREBASE_AUTH_CONFIG)
+            remember_employee(st.session_state, firebase_employee)
+            LOGGER.info(
+                "auth.token_verified role=%s elapsed_ms=%.1f",
+                firebase_employee.role,
+                (perf_counter() - auth_started) * 1000,
+            )
+        except FirebaseAuthError as exc:
+            clear_auth_session(st.session_state)
+            LOGGER.warning(
+                "auth.token_verification_failed category=%s elapsed_ms=%.1f",
+                type(exc).__name__,
+                (perf_counter() - auth_started) * 1000,
+            )
+            st.error(str(exc))
+    if firebase_employee is None:
+        firebase_employee = session_employee(st.session_state)
+    if firebase_employee is None:
+        st.stop()
+    require_permission(firebase_employee, "view_dashboard")
+    if auth_panel_slot is not None:
+        # The component was rendered before its ID-token event was processed.
+        # Clear that same slot so the login form cannot remain above the hero
+        # during the authenticated run.
+        auth_panel_slot.empty()
+
+if ENABLE_LOCAL_WORKBOOK_DEMO:
+    saved_local_link = load_link()
+    if saved_local_link:
+        # Keep the reference in session state, but do not trust it as loaded
+        # data until the file is read and validated in this process.
+        st.session_state.active_workbook_path = saved_local_link.path
 previous_report = st.session_state.get("active_workbook_report")
 previous_name = st.session_state.get("active_workbook_name")
 previous_content = st.session_state.get("active_workbook_content")
 workbook_report = None
 load_error = None
 uploaded = None
-refresh_clicked = False
-uploaded = render_top_header()
+refresh_clicked = bool(st.session_state.pop("local_refresh_requested", False)) if ENABLE_LOCAL_WORKBOOK_DEMO else False
+reload_saved_data_requested = bool(st.session_state.pop("reload_saved_data_requested", False))
+
+def _activate_restored_snapshot(restored_snapshot, *, refreshed_at: str | None = None) -> None:
+    """Make a verified Firestore snapshot the active dashboard dataset."""
+    completed_at = refreshed_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    st.session_state.active_workbook_report = restored_snapshot.report
+    st.session_state.active_workbook_name = restored_snapshot.source.filename
+    st.session_state.active_workbook_id = restored_snapshot.source.source_checksum
+    st.session_state.active_workbook_source_type = "firestore_snapshot"
+    st.session_state.active_workbook_report_schema = REPORT_SCHEMA_VERSION
+    st.session_state.active_workbook_path = ""
+    st.session_state.active_workbook_content = None
+    st.session_state.active_workbook_last_refresh = completed_at
+    st.session_state.active_workbook_last_saved = restored_snapshot.published_at.isoformat()
+    st.session_state.active_workbook_stale = False
+    st.session_state.dev_snapshot_id = restored_snapshot.snapshot_id
+    st.session_state.dev_snapshot_published_at = restored_snapshot.published_at.isoformat()
+    st.session_state.dev_snapshot_restore_error = ""
+    st.session_state.dev_snapshot_publish_error = ""
+    st.session_state.dev_snapshot_saved_notice = ""
+    st.session_state.dev_snapshot_publisher_name = restored_snapshot.source.publisher_display_name or ""
+    st.session_state.workbook_replace_open = False
+
+
+def _apply_shared_refresh_metadata(snapshot_id: str) -> None:
+    """Load the authenticated user's shared refresh identity for the active snapshot."""
+    st.session_state.active_workbook_last_refreshed_by = ""
+    if not ENABLE_DEV_FIRESTORE_SNAPSHOTS:
+        return
+    try:
+        metadata = read_snapshot_refresh_metadata(
+            snapshot_id=snapshot_id,
+            namespace=DEV_SNAPSHOT_NAMESPACE,
+        )
+    except Exception:
+        LOGGER.exception("dashboard_snapshot.refresh_metadata_read_failed snapshot_id=%s", snapshot_id)
+        return
+    if not metadata:
+        return
+    st.session_state.active_workbook_last_refreshed_by = str(metadata.get("first_name") or "")
+    refreshed_at = metadata.get("refreshed_at")
+    if isinstance(refreshed_at, datetime):
+        st.session_state.active_workbook_last_refresh = refreshed_at.isoformat()
+    elif isinstance(refreshed_at, str) and refreshed_at.strip():
+        st.session_state.active_workbook_last_refresh = refreshed_at.strip()
+
+# Restore the saved snapshot before rendering the hero upload component.  This
+# lets the first render choose exactly one state (ready card or native uploader)
+# instead of briefly mounting the uploader and replacing it later in the run.
+if ENABLE_DEV_FIRESTORE_SNAPSHOTS and not refresh_clicked and not reload_saved_data_requested and previous_report is None:
+    snapshot_restore_started = perf_counter()
+    try:
+        restored_snapshot = restore_dashboard_snapshot(namespace=DEV_SNAPSHOT_NAMESPACE)
+        if restored_snapshot is not None:
+            workbook_report = restored_snapshot.report
+            _activate_restored_snapshot(restored_snapshot)
+            _apply_shared_refresh_metadata(restored_snapshot.snapshot_id)
+            if st.session_state.get("workbook_refresh_status") not in {"refreshing", "success", "error"}:
+                st.session_state.workbook_refresh_status = ""
+                st.session_state.workbook_refresh_error = ""
+            LOGGER.info(
+                "dashboard_snapshot.restore_success namespace=%s snapshot_id=%s frames=%d rows=%d elapsed_ms=%.1f",
+                DEV_SNAPSHOT_NAMESPACE,
+                restored_snapshot.snapshot_id,
+                int(restored_snapshot.stats.get("frame_count", 0)),
+                int(restored_snapshot.stats.get("row_count", 0)),
+                (perf_counter() - snapshot_restore_started) * 1000,
+            )
+    except Exception as exc:
+        LOGGER.exception(
+            "dashboard_snapshot_restore_failed elapsed_ms=%.1f",
+            (perf_counter() - snapshot_restore_started) * 1000,
+        )
+        st.session_state.dev_snapshot_restore_error = str(exc)
+
+upload_panel_started_ready = bool(
+    st.session_state.get("active_workbook_name")
+    and st.session_state.get("active_workbook_source_type")
+    and st.session_state.get("active_workbook_report") is not None
+    and not st.session_state.get("workbook_replace_open", False)
+)
+uploaded, upload_content_slot = render_top_header()
+
+# A requested saved-data refresh is intentionally performed after the hero has
+# rendered once, so the user sees the compact "Refreshing..." state before the
+# existing Firebase restore call completes. The next rerun then shows the
+# success/error result and the corresponding timestamp.
+if ENABLE_DEV_FIRESTORE_SNAPSHOTS and reload_saved_data_requested and not refresh_clicked:
+    snapshot_restore_started = perf_counter()
+    try:
+        restored_snapshot = restore_dashboard_snapshot(namespace=DEV_SNAPSHOT_NAMESPACE)
+        if restored_snapshot is None:
+            raise ValueError("No saved dashboard snapshot is available.")
+        _activate_restored_snapshot(
+            restored_snapshot,
+            refreshed_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        if firebase_employee is not None:
+            try:
+                refresh_metadata = record_snapshot_refresh(
+                    snapshot_id=restored_snapshot.snapshot_id,
+                    workbook_id=restored_snapshot.source.workbook_id,
+                    user_uid=firebase_employee.uid,
+                    first_name=_refresh_first_name(firebase_employee) or "Team member",
+                    display_name=firebase_employee.display_name,
+                    namespace=DEV_SNAPSHOT_NAMESPACE,
+                )
+                st.session_state.active_workbook_last_refreshed_by = str(
+                    refresh_metadata.get("first_name") or ""
+                )
+                server_refreshed_at = refresh_metadata.get("refreshed_at")
+                if isinstance(server_refreshed_at, datetime):
+                    st.session_state.active_workbook_last_refresh = server_refreshed_at.isoformat()
+            except Exception:
+                # The workbook remains safely restored, but do not claim a
+                # new shared identity when the metadata write was rejected.
+                LOGGER.exception(
+                    "dashboard_snapshot.refresh_metadata_write_failed snapshot_id=%s",
+                    restored_snapshot.snapshot_id,
+                )
+                _apply_shared_refresh_metadata(restored_snapshot.snapshot_id)
+        else:
+            _apply_shared_refresh_metadata(restored_snapshot.snapshot_id)
+        st.session_state.workbook_refresh_status = "success"
+        st.session_state.workbook_refresh_error = ""
+        st.session_state.workbook_refresh_just_completed = True
+        LOGGER.info(
+            "dashboard_snapshot.refresh_success namespace=%s snapshot_id=%s elapsed_ms=%.1f",
+            DEV_SNAPSHOT_NAMESPACE,
+            restored_snapshot.snapshot_id,
+            (perf_counter() - snapshot_restore_started) * 1000,
+        )
+    except Exception as exc:
+        st.session_state.workbook_refresh_status = "error"
+        st.session_state.workbook_refresh_error = str(exc)
+        st.session_state.dev_snapshot_restore_error = str(exc)
+        LOGGER.exception(
+            "dashboard_snapshot.refresh_failed namespace=%s elapsed_ms=%.1f",
+            DEV_SNAPSHOT_NAMESPACE,
+            (perf_counter() - snapshot_restore_started) * 1000,
+        )
+    st.rerun()
 
 def parse_and_activate(
     content: bytes,
@@ -999,6 +1698,9 @@ def parse_and_activate(
     file_stat: object | None = None,
     force_refresh: bool = False,
 ):
+    publisher = firebase_employee
+    if FIREBASE_AUTH_CONFIG.enabled:
+        require_permission(publisher, "publish_workbook")
     content_id = workbook_content_id(content)
     if force_refresh:
         # Explicit refresh means "reprocess the latest saved source";
@@ -1016,7 +1718,89 @@ def parse_and_activate(
     if not has_verified_inventory(report):
         raise ValueError("No verified inventory rows were found in Current Week Model or Forecasted Inventory Levels.")
     _activate_workbook(report, source_type=source_type, name=name, content_id=content_id, content=content, path=path, file_stat=file_stat)
+    # A validated replacement returns the compact ready state. Failed
+    # replacements leave this flag set so the native uploader remains open.
+    st.session_state.workbook_replace_open = False
+    if ENABLE_DEV_FIRESTORE_SNAPSHOTS:
+        snapshot_started = perf_counter()
+        try:
+            LOGGER.info(
+                "dashboard_snapshot.publish_attempt namespace=%s source_type=%s content_id=%s",
+                DEV_SNAPSHOT_NAMESPACE,
+                source_type,
+                content_id[:12],
+            )
+            prior_snapshot_version = active_snapshot_version(namespace=DEV_SNAPSHOT_NAMESPACE)
+            published = publish_dashboard_snapshot(
+                report,
+                SnapshotSource(
+                    workbook_id=f"{DEV_SNAPSHOT_NAMESPACE}:{content_id[:24]}",
+                    filename=name,
+                    source_version=content_id,
+                    source_checksum=content_id,
+                    publisher_uid=publisher.uid if publisher is not None else None,
+                    publisher_display_name=publisher.display_name if publisher is not None else None,
+                ),
+                namespace=DEV_SNAPSHOT_NAMESPACE,
+                expected_active_version=prior_snapshot_version,
+            )
+            st.session_state.dev_snapshot_id = published.snapshot_id
+            st.session_state.dev_snapshot_published_at = published.published_at.isoformat()
+            # For Firebase-backed uploads, Last saved is the server-side
+            # publication time—not the time the user clicked Refresh.
+            st.session_state.active_workbook_last_saved = published.published_at.isoformat()
+            st.session_state.dev_snapshot_publish_error = ""
+            st.session_state.dev_snapshot_restore_error = ""
+            st.session_state.dev_snapshot_saved_notice = published.published_at.isoformat()
+            st.session_state.dev_snapshot_publisher_name = published.source.publisher_display_name or ""
+            LOGGER.info(
+                "dashboard_snapshot.publish_success namespace=%s snapshot_id=%s frames=%d rows=%d elapsed_ms=%.1f",
+                DEV_SNAPSHOT_NAMESPACE,
+                published.snapshot_id,
+                int(published.stats.get("frame_count", 0)),
+                int(published.stats.get("row_count", 0)),
+                (perf_counter() - snapshot_started) * 1000,
+            )
+        except Exception as exc:
+            # A Firebase publication failure must not discard a locally
+            # validated workbook that is already safe to display.
+            LOGGER.exception(
+                "dashboard_snapshot_publish_failed filename=%s elapsed_ms=%.1f",
+                name,
+                (perf_counter() - snapshot_started) * 1000,
+            )
+            st.session_state.dev_snapshot_publish_error = str(exc)
+            st.session_state.dev_snapshot_saved_notice = ""
     return report
+
+
+if ENABLE_LOCAL_WORKBOOK_DEMO and st.session_state.get("active_workbook_path"):
+    local_path = st.session_state.get("active_workbook_path")
+    local_path_pending = bool(st.session_state.pop("local_link_pending", False))
+    local_path_loaded = st.session_state.get("local_link_loaded_path")
+    should_load_saved = previous_report is None and local_path_loaded != local_path
+    if local_path_pending or should_load_saved:
+        try:
+            linked_path, linked_content, linked_stat = _read_linked_workbook(local_path)
+            workbook_report = parse_and_activate(
+                linked_content,
+                name=linked_path.name,
+                source_type="local_link",
+                path=linked_path,
+                file_stat=linked_stat,
+                force_refresh=True,
+            )
+            st.session_state.local_link_loaded_path = str(linked_path)
+            st.session_state.local_link_picker_error = ""
+        except Exception as exc:
+            # Keep any prior verified report active; the normal error banner
+            # explains that the synchronized file is unavailable or invalid.
+            load_error = str(exc)
+            LOGGER.exception("excel.local_link_load_failed path=%s", local_path)
+            st.session_state.active_workbook_error = load_error
+            if previous_report is not None:
+                st.session_state.active_workbook_stale = True
+                workbook_report = previous_report
 
 
 if refresh_clicked and st.session_state.get("active_workbook_path"):
@@ -1049,6 +1833,7 @@ if refresh_clicked and st.session_state.get("active_workbook_path"):
         st.session_state.active_workbook_stale = True
         workbook_report = previous_report
 
+
 if uploaded is not None and not refresh_clicked:
     upload_received_started = perf_counter()
     uploaded_bytes = uploaded.getvalue()
@@ -1069,6 +1854,7 @@ if uploaded is not None and not refresh_clicked:
         and previous_report is not None
     ):
         workbook_report = previous_report
+        st.session_state.workbook_replace_open = False
         # A replacement can be byte-for-byte identical while arriving under
         # a new filename. Reuse the verified parse, but still update the
         # snapshot metadata so the UI reflects the workbook the user chose.
@@ -1114,6 +1900,7 @@ if uploaded is not None and not refresh_clicked:
                 # stale so a failed replacement is never mistaken for the
                 # newly selected file.
                 st.session_state.active_workbook_error = load_error
+                st.session_state.dev_snapshot_saved_notice = ""
                 if previous_report is not None:
                     st.session_state.active_workbook_stale = True
                 upload_status.update(label="Upload failed — see details below", state="error")
@@ -1126,6 +1913,17 @@ elif workbook_report is None and previous_report is not None:
 # intentionally has no success banner, and a failed replacement takes
 # precedence over the previous workbook's success state.
 active_source = st.session_state.get("active_workbook_source_type", "")
+# The initial upload form is rendered before restoration/upload processing so
+# replace its content with the ready card once a validated source is known.
+if (
+    workbook_report is not None
+    and active_source in {"upload", "local_link", "firestore_snapshot"}
+    and not load_error
+    and not upload_panel_started_ready
+):
+    upload_content_slot.empty()
+    with upload_content_slot.container():
+        _render_workbook_ready_card()
 if load_error:
     render_upload_error(
         load_error,
@@ -1141,6 +1939,21 @@ elif workbook_report is not None and active_source in {"upload", "local_link"}:
         loaded_records,
         source_type=active_source,
     )
+    if ENABLE_DEV_FIRESTORE_SNAPSHOTS and st.session_state.get("dev_snapshot_saved_notice"):
+        st.success("Dashboard data successfully saved to Firebase.")
+        _render_snapshot_publication_identity()
+if ENABLE_DEV_FIRESTORE_SNAPSHOTS:
+    restore_error = st.session_state.get("dev_snapshot_restore_error")
+    publish_error = st.session_state.get("dev_snapshot_publish_error")
+    if restore_error:
+        st.warning(f"The saved development snapshot could not be restored: {restore_error}")
+    if publish_error:
+        st.warning(f"The workbook loaded locally, but the development snapshot was not published: {publish_error}")
+
+# Sidebar navigation callbacks update this value before the rerun begins. Use
+# it to suppress analysis-only controls while Settings is being rendered,
+# without changing the selected worksheet or any calculations.
+settings_page_active = st.session_state.get("sidebar_page", "Executive Overview") == "Settings"
 
 if workbook_report is None:
     df = demo_data()
@@ -1153,11 +1966,18 @@ else:
     ]
     sheet_options = inventory_sheets or list(workbook_report.frames)
     if sheet_options:
-        selected_sheet = st.selectbox(
-            "Primary inventory worksheet",
-            sheet_options,
-            index=sheet_options.index(workbook_report.preferred_sheet) if workbook_report.preferred_sheet in sheet_options else 0,
-        )
+        preferred_sheet = workbook_report.preferred_sheet if workbook_report.preferred_sheet in sheet_options else sheet_options[0]
+        selected_sheet = st.session_state.get("primary_inventory_worksheet", preferred_sheet)
+        if selected_sheet not in sheet_options:
+            selected_sheet = preferred_sheet
+        st.session_state.primary_inventory_worksheet = selected_sheet
+        if not settings_page_active:
+            selected_sheet = st.selectbox(
+                "Primary inventory worksheet",
+                sheet_options,
+                index=sheet_options.index(selected_sheet),
+                key="primary_inventory_worksheet",
+            )
     else:
         selected_sheet = ""
     if selected_sheet and selected_sheet in workbook_report.frames:
@@ -1177,6 +1997,8 @@ if workbook_report is not None:
         source_status = "Local workbook · verified data"
         if st.session_state.get("active_workbook_stale"):
             source_status = "Local workbook · showing last successful update"
+    elif active_source == "firestore_snapshot":
+        source_status = "Firebase development snapshot · verified data"
 timeline_filter_frame = None
 if workbook_report is not None:
     _, timeline_filter_frame = frame_for(workbook_report, "inventory_timeline")
@@ -1190,7 +2012,10 @@ year_frames = [
 year_source = pd.concat(year_frames, ignore_index=True) if year_frames else pd.DataFrame(columns=["year"])
 year_options = options(year_source, "year")
 week_options = options(week_option_frame, "week")
-filter_signature = f"{getattr(workbook_report, 'content_id', 'demo')}::{source_sheet or 'demo'}"
+filter_signature = (
+    f"{active_source or 'demo'}::{getattr(workbook_report, 'content_id', 'demo')}::"
+    f"{source_sheet or 'demo'}"
+)
 filter_keys = {
     "year": "filter_year", "week": "filter_week", "variety": "filter_variety",
     "size": "filter_size", "classification": "filter_classification",
@@ -1204,6 +2029,25 @@ if st.session_state.get("filter_signature") != filter_signature:
 for key in filter_keys.values():
     st.session_state.setdefault(key, [])
 
+# Streamlit can retain widget state while a session reconnects or while a
+# restored snapshot replaces an uploaded workbook.  Keep valid selections,
+# but discard values that are no longer present in the active dataset.  An
+# empty selection is the canonical representation of "All" for every
+# multiselect dimension.
+filter_value_options = {
+    "year": set(year_options),
+    "week": set(week_options),
+    "variety": set(options(df, "variety")),
+    "size": set(options(df, "size")),
+    "product": set(),
+}
+for dimension, key in filter_keys.items():
+    if dimension not in filter_value_options:
+        continue
+    selected_values = st.session_state.get(key, []) or []
+    valid_values = filter_value_options[dimension]
+    st.session_state[key] = [value for value in selected_values if value in valid_values]
+
 
 def sync_classification_filter() -> None:
     choice = st.session_state.get("filter_classification_segment", "All")
@@ -1215,6 +2059,13 @@ if "filter_classification_segment" not in st.session_state:
     st.session_state["filter_classification_segment"] = (
         existing_classification[0] if len(existing_classification) == 1 else "All"
     )
+classification_choice = st.session_state.get("filter_classification_segment", "All")
+if classification_choice not in {"All", "Organic", "Conventional"}:
+    classification_choice = "All"
+    st.session_state["filter_classification_segment"] = classification_choice
+st.session_state[filter_keys["classification"]] = (
+    [] if classification_choice == "All" else [classification_choice]
+)
 
 # Packaging is only useful as a visible filter when the loaded data contains
 # more than one valid option. Keep a hidden/stale selection from affecting
@@ -1282,7 +2133,7 @@ if harvest_view_available:
 if purchasing_view_available:
     navigation_pages.append("Purchasing & Loads")
 navigation_pages.append("Data Explorer & Quality")
-active_page = render_sidebar_navigation(navigation_pages)
+active_page = render_sidebar_navigation(navigation_pages, firebase_employee=firebase_employee)
 
 # This warning belongs only to pages that actually render the shared
 # inventory-filter dataset. X-Blocking and Settings use independent layouts
@@ -1333,7 +2184,7 @@ if workbook_report:
             st.dataframe(report_to_frame(workbook_report), width="stretch", hide_index=True)
             st.caption(f"Deferred worksheets: {len(workbook_report.deferred_sheets)}. They are not opened or converted until explicitly requested.")
             st.dataframe(timings_to_frame(workbook_report), width="stretch", hide_index=True)
-if workbook_report is not None and source_sheet == workbook_report.semantic_sheets.get("inventory") and not filtered.empty:
+if not settings_page_active and workbook_report is not None and source_sheet == workbook_report.semantic_sheets.get("inventory") and not filtered.empty:
     model_week = ", ".join(options(filtered, "week")) or "selected week"
     contribution = pd.to_numeric(filtered.get("contribution_margin"), errors="coerce").sum(min_count=1) if "contribution_margin" in filtered else None
     upcoming = pd.to_numeric(filtered.get("upcoming_demand_lbs"), errors="coerce").sum(min_count=1) if "upcoming_demand_lbs" in filtered else None
@@ -1413,6 +2264,149 @@ def source_frame_for(semantic: str, measures: list[str]) -> tuple[str | None, pd
             return source_sheet, frame
     return None, None
 
+
+def render_team_management(admin: FirebaseEmployee | None) -> None:
+    """Render admin-only invitation and access controls inside Settings."""
+    if admin is None or not admin.can("manage_users"):
+        return
+
+    st.markdown("#### Team Management")
+    st.caption("Invite approved teammates and manage their dashboard access.")
+    with st.container(border=True):
+        invite_columns = st.columns([2.4, 1.2, 1.1], vertical_alignment="bottom")
+        with invite_columns[0]:
+            invite_email = st.text_input(
+                "Teammate email",
+                placeholder="teammate@company.com",
+                key="team_invite_email",
+            )
+        with invite_columns[1]:
+            invite_role = st.selectbox(
+                "Role",
+                ["Viewer", "Publisher"],
+                key="team_invite_role",
+            )
+        with invite_columns[2]:
+            create_invite = st.button("Create Invitation", key="team_create_invitation", type="primary", width="stretch")
+        if create_invite:
+            normalized_email = invite_email.strip().casefold()
+            if "@" not in normalized_email:
+                st.session_state.team_management_error = "Enter a valid teammate email address."
+            else:
+                try:
+                    code = invite_teammate(
+                        normalized_email,
+                        display_name=None,
+                        role=invite_role.casefold(),
+                        admin=admin,
+                    )
+                    st.session_state.team_invitation_notice = {
+                        "email": normalized_email,
+                        "role": invite_role,
+                        "code": code,
+                    }
+                    st.session_state.team_management_error = ""
+                except FirebaseAuthError as exc:
+                    st.session_state.team_management_error = str(exc)
+                except Exception:
+                    LOGGER.exception("team_management.invitation_create_failed")
+                    st.session_state.team_management_error = "The invitation could not be created. Check Firebase connectivity and try again."
+
+        team_error = st.session_state.get("team_management_error")
+        if team_error:
+            st.error(team_error)
+        invitation_notice = st.session_state.get("team_invitation_notice")
+        if isinstance(invitation_notice, dict) and invitation_notice.get("code"):
+            st.success(
+                f"Invitation created with {invitation_notice.get('role', 'Viewer')} access."
+            )
+            st.text(str(invitation_notice.get("email") or "Email unavailable"))
+            st.caption("No email was sent automatically. Deliver this one-time code through an approved private channel, then hide it.")
+            st.code(str(invitation_notice["code"]), language="text")
+            if st.button("Hide invitation code", key="team_hide_invitation_code"):
+                st.session_state.pop("team_invitation_notice", None)
+                st.rerun()
+
+        st.markdown("##### Pending invitations")
+        try:
+            invitations = list_invitations(admin=admin)
+        except FirebaseAuthError as exc:
+            invitations = []
+            st.warning(str(exc))
+        except Exception:
+            LOGGER.exception("team_management.invitation_list_failed")
+            invitations = []
+            st.warning("Invitation status is temporarily unavailable.")
+        if not invitations:
+            st.caption("No invitations have been created yet.")
+        else:
+            for invitation in invitations[:20]:
+                row = st.columns([2.4, .9, 1.25, 1.05], vertical_alignment="center")
+                with row[0]:
+                    st.text(invitation.get("email") or "Email unavailable")
+                with row[1]:
+                    st.caption(str(invitation.get("role") or "Unknown").title())
+                with row[2]:
+                    status = str(invitation.get("status") or "unknown").title()
+                    st.caption(status)
+                    if invitation.get("expires_at"):
+                        st.caption(f"Until {_pacific_timestamp_label(invitation['expires_at'])}")
+                with row[3]:
+                    if invitation.get("status") == "pending":
+                        if st.button("Revoke", key=f"team_cancel_invite_{invitation['id']}"):
+                            try:
+                                cancel_invitation(invitation["id"], admin=admin)
+                                st.session_state.team_management_error = ""
+                                st.rerun()
+                            except FirebaseAuthError as exc:
+                                st.session_state.team_management_error = str(exc)
+                            except Exception:
+                                LOGGER.exception("team_management.invitation_cancel_failed")
+                                st.session_state.team_management_error = "The invitation could not be revoked. Try again."
+            if len(invitations) > 20:
+                st.caption(f"Showing the 20 most recent of {len(invitations)} invitations.")
+
+        st.markdown("##### Authorized team members")
+        try:
+            members = list_team_members(admin=admin)
+        except FirebaseAuthError as exc:
+            members = []
+            st.warning(str(exc))
+        except Exception:
+            LOGGER.exception("team_management.member_list_failed")
+            members = []
+            st.warning("Authorized team members are temporarily unavailable.")
+        if not members:
+            st.caption("No approved team members were found.")
+        else:
+            for member in members:
+                row = st.columns([2.2, .9, 1.15, 1.05], vertical_alignment="center")
+                with row[0]:
+                    st.text(member.get("email") or "Email unavailable")
+                    if member.get("display_name") and member.get("display_name") != member.get("email"):
+                        st.caption(str(member["display_name"]))
+                with row[1]:
+                    st.caption(str(member.get("role") or "Unknown").title())
+                with row[2]:
+                    if member.get("disabled"):
+                        st.caption("Revoked")
+                    elif member.get("email_verified"):
+                        st.caption("Verified")
+                    else:
+                        st.caption("Unverified")
+                with row[3]:
+                    if member.get("uid") != admin.uid and not member.get("disabled"):
+                        if st.button("Revoke", key=f"team_revoke_user_{member['uid']}"):
+                            try:
+                                revoke_user(str(member["uid"]), admin=admin)
+                                st.session_state.team_management_error = ""
+                                st.rerun()
+                            except FirebaseAuthError as exc:
+                                st.session_state.team_management_error = str(exc)
+                            except Exception:
+                                LOGGER.exception("team_management.member_revoke_failed")
+                                st.session_state.team_management_error = "Access could not be revoked. Try again."
+
 if active_page == "Settings":
     st.subheader("Settings")
     st.write("Manage your dashboard preferences and application settings.")
@@ -1460,6 +2454,7 @@ if active_page == "Settings":
     )
     st.caption("The header updates after you apply a location or change units.")
     st.caption("Additional customization options will be introduced in a future update.")
+    render_team_management(firebase_employee)
 
 if active_page == "X-Blocking Analysis":
     st.subheader("X-Blocking Analysis")
@@ -1491,41 +2486,62 @@ if active_page == "X-Blocking Analysis":
                     key="x_blocking_reporting_week",
                 )
                 selected_period = periods.loc[periods["selection_label"] == selected_period_label].iloc[0]
-                variety_values = sorted(
-                    {
-                        str(value).strip()
-                        for frame in (timeline_frame, harvest_frame, sales_frame)
-                        if frame is not None and "variety" in frame
-                        for value in frame["variety"].dropna().tolist()
-                        if str(value).strip()
-                    },
-                    key=str.casefold,
+                # X-Blocking options are anchored to the verified inventory
+                # timeline.  Harvest/sales may contain products that have no
+                # matching inventory balance (for example process-only rows),
+                # so using those frames to populate controls would offer
+                # selections that cannot produce an inventory comparison.
+                x_option_frame = timeline_frame
+                if "classification" in timeline_frame:
+                    organic_options = timeline_frame[
+                        timeline_frame["classification"].astype("string").str.casefold().eq("organic")
+                    ]
+                    if not organic_options.empty:
+                        x_option_frame = organic_options
+                variety_values, variety_source_values = standardized_dimension_options(
+                    (x_option_frame,), "variety"
                 )
-                size_values = sorted(
-                    {
-                        str(value).strip()
-                        for frame in (timeline_frame, harvest_frame, sales_frame)
-                        if frame is not None and "size" in frame
-                        for value in frame["size"].dropna().tolist()
-                        if str(value).strip()
-                    },
-                    key=str.casefold,
+                size_values, size_source_values = standardized_dimension_options(
+                    (x_option_frame,), "size"
                 )
-                x_filter_left, x_filter_right = st.columns(2, gap="small")
-                with x_filter_left:
-                    selected_varieties = st.multiselect(
-                        "Organic variety",
-                        variety_values,
-                        key="x_blocking_variety",
-                        placeholder="All varieties",
-                    )
-                with x_filter_right:
-                    selected_sizes = st.multiselect(
-                        "Size",
-                        size_values,
-                        key="x_blocking_size",
-                        placeholder="All sizes",
-                    )
+                with st.container(key="x_blocking_filter_controls"):
+                    x_filter_left, x_filter_right = st.columns(2, gap="small")
+                    with x_filter_left:
+                        with st.container(key="x_filter_tile_variety"):
+                            st.markdown(
+                                f"<div class='cs-filter-control-label'>{dashboard_icon('sprout', size=26)}<strong>Organic variety</strong></div>",
+                                unsafe_allow_html=True,
+                            )
+                            selected_variety_labels = st.multiselect(
+                                "Organic variety",
+                                variety_values,
+                                key="x_blocking_variety",
+                                placeholder="All varieties",
+                                label_visibility="collapsed",
+                            )
+                    with x_filter_right:
+                        with st.container(key="x_filter_tile_size"):
+                            st.markdown(
+                                f"<div class='cs-filter-control-label'>{dashboard_icon('scaling', size=26)}<strong>Size</strong></div>",
+                                unsafe_allow_html=True,
+                            )
+                            selected_size_labels = st.multiselect(
+                                "Size",
+                                size_values,
+                                key="x_blocking_size",
+                                placeholder="All sizes",
+                                label_visibility="collapsed",
+                            )
+                selected_varieties = [
+                    raw_value
+                    for display_label in selected_variety_labels
+                    for raw_value in variety_source_values.get(display_label, [display_label])
+                ]
+                selected_sizes = [
+                    raw_value
+                    for display_label in selected_size_labels
+                    for raw_value in size_source_values.get(display_label, [display_label])
+                ]
                 horizon_values = organic_horizon_options(timeline_frame, selected_period)
                 selected_horizon = st.selectbox(
                     "Planning horizon",

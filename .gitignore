@@ -15,5 +15,12 @@ __pycache__/
 # Local Streamlit state and secrets
 .streamlit/secrets.toml
 
+# Local CSUB OneDrive-sync demo references (paths only, never workbook bytes)
+csub_demo_workbook.json
+.csub-local/
+
 # Temporary workbook exports
 ~$*.xlsx
+
+# Local Streamlit runtime logs
+*.log
