@@ -921,6 +921,10 @@ def dashboard_icon(name: str, *, size: int = 24) -> str:
 
 def render_sidebar_navigation(page_names: list[str], *, firebase_employee: FirebaseEmployee | None = None) -> str:
     """Render compact native buttons in the expanded sidebar."""
+    def select_page(selected_page: str) -> None:
+        st.session_state.sidebar_page = selected_page
+        st.session_state.navigation_started_at = perf_counter()
+
     icons = {
         "Executive Overview": ":material/dashboard:",
         "Inventory Timeline": ":material/timeline:",
@@ -951,7 +955,8 @@ def render_sidebar_navigation(page_names: list[str], *, firebase_employee: Fireb
                     key=f"sidebar_nav_{page.lower().replace(' ', '_').replace('&', 'and').replace('.', '')}",
                     type="primary" if page == current else "secondary",
                     width="stretch",
-                    on_click=lambda selected_page=page: st.session_state.update(sidebar_page=selected_page),
+                    on_click=select_page,
+                    args=(page,),
                 ):
                     current = page
         with st.container(key="sidebar_settings"):
@@ -961,7 +966,8 @@ def render_sidebar_navigation(page_names: list[str], *, firebase_employee: Fireb
                 key="sidebar_nav_settings",
                 type="primary" if current == "Settings" else "secondary",
                 width="stretch",
-                on_click=lambda: st.session_state.update(sidebar_page="Settings"),
+                on_click=select_page,
+                args=("Settings",),
             ):
                 current = "Settings"
             if firebase_employee is not None:
@@ -1055,6 +1061,7 @@ OPEN_METEO_TIMEOUT_SECONDS = 4
 OPEN_METEO_ATTEMPTS = 2
 OPEN_METEO_CACHE_SECONDS = 900
 WEATHER_STALE_SECONDS = 21600
+WEATHER_FAILURE_COOLDOWN_SECONDS = 60
 
 
 def _open_meteo_get(endpoint: str, *, params: dict[str, object], operation: str) -> requests.Response:
@@ -1225,6 +1232,28 @@ def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahr
     """Return live conditions, or a recent successful result when the provider is unavailable."""
     temperature_unit = "celsius" if temperature_unit == "celsius" else "fahrenheit"
     cache_key = (round(float(latitude), 4), round(float(longitude), 4))
+    recent = st.session_state.get("weather_last_success", {}).get(cache_key)
+    failure = st.session_state.get("weather_last_failure", {}).get(cache_key)
+    if isinstance(failure, dict):
+        failure_age = max(0.0, epoch_time() - float(failure.get("failed_at", 0.0)))
+        if failure_age < WEATHER_FAILURE_COOLDOWN_SECONDS:
+            if isinstance(recent, dict):
+                age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
+                if age <= WEATHER_STALE_SECONDS and isinstance(recent.get("weather"), dict):
+                    stale = dict(recent["weather"])
+                    source_unit = stale.get("temperature_unit", "fahrenheit")
+                    if source_unit != temperature_unit:
+                        source_temperature = float(stale["temperature"])
+                        stale["temperature"] = (
+                            (source_temperature - 32.0) * 5.0 / 9.0
+                            if temperature_unit == "celsius"
+                            else source_temperature * 9.0 / 5.0 + 32.0
+                        )
+                        stale["temperature_unit"] = temperature_unit
+                    stale["is_cached"] = True
+                    stale["cache_age_seconds"] = age
+                    return stale
+            raise requests.RequestException("Weather provider is in a temporary retry cooldown.")
     try:
         weather = dict(_get_weather_cached(float(latitude), float(longitude), temperature_unit))
         weather["is_cached"] = False
@@ -1232,10 +1261,14 @@ def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahr
             "weather": dict(weather),
             "saved_at": epoch_time(),
         }
+        st.session_state.setdefault("weather_last_failure", {}).pop(cache_key, None)
         return weather
     except (requests.RequestException, ValueError, TypeError) as exc:
+        st.session_state.setdefault("weather_last_failure", {})[cache_key] = {
+            "failed_at": epoch_time(),
+            "error_type": type(exc).__name__,
+        }
         LOGGER.warning("weather.forecast_parse_failed latitude=%s longitude=%s error=%s", latitude, longitude, exc)
-        recent = st.session_state.get("weather_last_success", {}).get(cache_key)
         if isinstance(recent, dict):
             age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
             if age <= WEATHER_STALE_SECONDS and isinstance(recent.get("weather"), dict):
@@ -3038,6 +3071,14 @@ LOGGER.info(
     (perf_counter() - visualization_started) * 1000,
     len(st.session_state.get("chart_timings", {})),
 )
+
+navigation_started_at = st.session_state.pop("navigation_started_at", None)
+if navigation_started_at is not None:
+    LOGGER.info(
+        "dashboard.navigation_complete page=%s elapsed_ms=%.1f",
+        active_page,
+        (perf_counter() - navigation_started_at) * 1000,
+    )
 
 if SHOW_PERFORMANCE_UI and st.session_state.get("chart_timings"):
     with st.expander("Dashboard render timings"):
