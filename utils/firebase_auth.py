@@ -780,8 +780,8 @@ FIREBASE_AUTH_HTML = """
 """
 
 FIREBASE_AUTH_CSS = """
-.firebase-auth-shell { width: 100%; min-height: min(760px, 100vh); position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); overflow: hidden; background: #004f3d; color: #153d32; font-family: inherit; }
-.firebase-auth-branding, .firebase-auth-stage { min-height: min(760px, 100vh); position: relative; display: grid; place-items: center; box-sizing: border-box; }
+.firebase-auth-shell { width: 100%; min-height: 100vh; min-height: 100dvh; position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); overflow: hidden; background: #004f3d; color: #153d32; font-family: inherit; }
+.firebase-auth-branding, .firebase-auth-stage { min-height: 100vh; min-height: 100dvh; position: relative; display: grid; place-items: center; box-sizing: border-box; }
 .firebase-auth-branding { isolation: isolate; overflow: hidden; background: transparent; z-index: 3; }
 .firebase-auth-stage { z-index: 1; }
 .firebase-auth-svg-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
@@ -844,30 +844,40 @@ export default function(component) {
   const status = parentElement.querySelector('#firebase-auth-status');
   if (!authTitle || !authSubtitle || !email || !password || !login || !reset || !verify || !logout || !status || !signupEmail || !signupPassword || !signupFirstName || !signupLastName || !inviteCode || !signup || !loginTab || !signupTab || !loginPanel || !signupPanel || !loading || !authTabs) return;
   let idToken = null;
-  const storageKey = `bako_firebase_refresh_${String(config.projectId || 'default')}`;
-  let refreshToken = null;
-  try { refreshToken = window.sessionStorage.getItem(storageKey) || null; } catch (error) {}
-  let refreshTimer = null;
+  let firebaseAuth = null;
+  let currentUser = null;
   let signupInFlight = false;
-  const fetchWithTimeout = (url, options = {}, timeoutMs = 15000) => {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, {...options, signal: controller.signal}).finally(() => window.clearTimeout(timeout));
+  const loadFirebaseSdk = () => {
+    if (window.firebase && window.firebase.auth) return Promise.resolve(window.firebase);
+    if (window.__bakoFirebaseSdkPromise) return window.__bakoFirebaseSdkPromise;
+    const urls = [
+      'https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js',
+      'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js',
+    ];
+    window.__bakoFirebaseSdkPromise = new Promise((resolve, reject) => {
+      const load = (index) => {
+        if (index >= urls.length) { resolve(window.firebase); return; }
+        const script = document.createElement('script');
+        script.src = urls[index];
+        script.async = true;
+        script.crossOrigin = 'anonymous';
+        script.onload = () => load(index + 1);
+        script.onerror = () => reject(new Error('Firebase browser SDK could not be loaded.'));
+        document.head.appendChild(script);
+      };
+      load(0);
+    });
+    return window.__bakoFirebaseSdkPromise;
   };
-  const post = (path, payload) => fetchWithTimeout(`https://identitytoolkit.googleapis.com/v1/${path}?key=${encodeURIComponent(config.apiKey)}`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }).then(async response => { const body = await response.json(); if (!response.ok) throw new Error(body?.error?.message || 'Firebase authentication failed'); return body; });
-  const clearStoredSession = () => { try { window.sessionStorage.removeItem(storageKey); } catch (error) {} };
-  const storeRefreshToken = (value) => { refreshToken = value || null; try { if (refreshToken) window.sessionStorage.setItem(storageKey, refreshToken); } catch (error) {} };
-  const refresh = async () => { if (!refreshToken) return; try { const response = await fetchWithTimeout(`https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(config.apiKey)}`, {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`}); const body = await response.json(); if (!response.ok) throw new Error(body?.error || 'refresh failed'); idToken = body.id_token; storeRefreshToken(body.refresh_token || refreshToken); if (!data?.verification_only) { if (data?.signup_approved && signupEmail.value.trim() && inviteCode.value.trim()) setTriggerValue('signup_result', {id_token: idToken, invite_code: inviteCode.value.trim(), first_name: signupFirstName.value.trim(), last_name: signupLastName.value.trim()}); else setTriggerValue('id_token', idToken); } scheduleRefresh(Number(body.expires_in || 3600)); } catch (error) { clearStoredSession(); refreshToken = null; showLogin(); show('Your sign-in session could not be restored. Please sign in again.'); } };
-  const scheduleRefresh = (seconds) => { if (refreshTimer) window.clearTimeout(refreshTimer); refreshTimer = window.setTimeout(refresh, Math.max(60, Number(seconds || 3600) - 120) * 1000); };
   const show = (message) => { status.textContent = message; };
   const signInError = (error) => {
-    const code = String(error?.message || '').toUpperCase();
+    const code = String(error?.code || error?.message || '').toUpperCase();
     if (code.includes('API_KEY_INVALID') || code.includes('INVALID_API_KEY')) return 'Firebase configuration mismatch. Check the Web App API key, auth domain, and App ID for project bako-sweet.';
-    if (code.includes('INVALID_LOGIN_CREDENTIALS') || code.includes('EMAIL_NOT_FOUND') || code.includes('INVALID_PASSWORD')) return 'Invalid email or password.';
+    if (code.includes('INVALID_LOGIN_CREDENTIALS') || code.includes('INVALID_CREDENTIAL') || code.includes('EMAIL_NOT_FOUND') || code.includes('INVALID_PASSWORD')) return 'Invalid email or password.';
     if (code.includes('USER_DISABLED')) return 'This Firebase account is disabled. Contact an administrator.';
     if (code.includes('OPERATION_NOT_ALLOWED')) return 'Email/password sign-in is not enabled for this Firebase project.';
-    if (code.includes('TOO_MANY_ATTEMPTS')) return 'Firebase temporarily limited sign-in attempts. Wait a few minutes, then retry.';
-    if (code.includes('FAILED_TO_FETCH') || code.includes('NETWORK')) return 'The browser could not reach Firebase. Check your network connection and authorized domain settings.';
+    if (code.includes('TOO_MANY_ATTEMPTS') || code.includes('TOO_MANY_REQUESTS')) return 'Firebase temporarily limited sign-in attempts. Wait a few minutes, then retry.';
+    if (code.includes('FAILED_TO_FETCH') || code.includes('NETWORK') || code.includes('NETWORK-REQUEST-FAILED')) return 'The browser could not reach Firebase. Check your network connection and authorized domain settings.';
     return 'Firebase rejected sign-in. Check the account credentials and email verification status.';
   };
   const verificationError = (error) => {
@@ -880,7 +890,30 @@ export default function(component) {
   };
   const showLogin = () => { loading.hidden = true; authTitle.hidden = false; authSubtitle.hidden = false; authTabs.hidden = true; loginPanel.hidden = false; signupPanel.hidden = true; verify.hidden = true; };
   const showSignup = () => { loading.hidden = true; authTitle.hidden = true; authSubtitle.hidden = true; authTabs.hidden = true; loginPanel.hidden = true; signupPanel.hidden = false; verify.hidden = true; };
-  const loadingRecoveryTimer = window.setTimeout(() => { if (!loading.hidden && !data?.authenticated) { clearStoredSession(); refreshToken = null; showLogin(); show('Your sign-in session could not be restored. Please sign in again.'); } }, 15000);
+  const showRestoring = () => { loading.hidden = false; loading.textContent = 'Restoring your session…'; authTitle.hidden = true; authSubtitle.hidden = true; authTabs.hidden = true; loginPanel.hidden = true; signupPanel.hidden = true; verify.hidden = true; };
+  const showUnverified = () => { showLogin(); verify.hidden = false; show('Verify your Firebase email address before accessing the dashboard.'); };
+  const loadingRecoveryTimer = window.setTimeout(() => { if (!loading.hidden && !data?.authenticated) { showLogin(); show('Your sign-in session could not be restored. Please sign in again.'); } }, 15000);
+  const handleUser = async (user) => {
+    currentUser = user || null;
+    if (!currentUser) { if (!data?.authenticated && !data?.verification_only) showLogin(); return; }
+    try {
+      await currentUser.reload();
+      if (currentUser.emailVerified !== true) { showUnverified(); return; }
+      window.clearTimeout(loadingRecoveryTimer);
+      if (!data?.authenticated && !data?.verification_only) {
+        showRestoring();
+        idToken = await currentUser.getIdToken();
+        setTriggerValue('id_token', idToken);
+        show('Verifying your account…');
+      } else {
+        loading.hidden = true;
+      }
+    } catch (error) {
+      currentUser = null;
+      showLogin();
+      show(signInError(error));
+    }
+  };
   const normalizeName = (value, label) => {
     const normalized = String(value || '').trim().replace(/\\s+/g, ' ');
     if (!normalized || normalized.length > 80 || !/^[\\p{L}][\\p{L}\\p{M}'’ .\\-]*$/u.test(normalized)) throw new Error(`${label} must contain letters and may include spaces, apostrophes, periods, or hyphens.`);
@@ -893,27 +926,14 @@ export default function(component) {
       login.disabled = true;
       verify.hidden = true;
       show('Verifying your account…');
-      const body = await post('accounts:signInWithPassword', {email: email.value.trim(), password: password.value, returnSecureToken: true});
-      idToken = body.idToken;
-      storeRefreshToken(body.refreshToken);
-      scheduleRefresh(Number(body.expiresIn || 3600));
-      const lookup = await post('accounts:lookup', {idToken});
-      const currentUser = Array.isArray(lookup?.users) ? lookup.users[0] : null;
-      if (!currentUser || currentUser.emailVerified !== true) {
-        verify.hidden = false;
-        show('Verify your Firebase email address before accessing the dashboard.');
-        return;
-      }
-      if (!data?.verification_only) {
-        setTriggerValue('id_token', idToken);
-        setStateValue('signed_in', true);
-      }
-      show('Verifying your account…');
+      if (!firebaseAuth) throw new Error('Firebase browser SDK is not ready.');
+      const credential = await firebaseAuth.signInWithEmailAndPassword(email.value.trim(), password.value);
+      await handleUser(credential.user);
     } catch (error) { show(signInError(error)); }
     finally { login.disabled = false; }
   };
-  reset.onclick = async () => { try { reset.disabled = true; await post('accounts:sendOobCode', {requestType: 'PASSWORD_RESET', email: email.value.trim()}); show('If that invited account exists, Firebase sent a password setup link.'); } catch (error) { show('If that invited account exists, Firebase sent a password setup link.'); } finally { reset.disabled = false; } };
-  verify.onclick = async () => { try { verify.disabled = true; if (!idToken) { show('Your Firebase sign-in session is no longer available. Sign in again, then retry.'); return; } await post('accounts:sendOobCode', {requestType: 'VERIFY_EMAIL', idToken}); show('Firebase accepted the verification email request. Check your inbox and spam folder.'); } catch (error) { show(verificationError(error)); } finally { verify.disabled = false; } };
+  reset.onclick = async () => { try { reset.disabled = true; if (!firebaseAuth) throw new Error('Firebase browser SDK is not ready.'); await firebaseAuth.sendPasswordResetEmail(email.value.trim()); show('If that invited account exists, Firebase sent a password setup link.'); } catch (error) { show('If that invited account exists, Firebase sent a password setup link.'); } finally { reset.disabled = false; } };
+  verify.onclick = async () => { try { verify.disabled = true; if (!currentUser) { show('Your Firebase sign-in session is no longer available. Sign in again, then retry.'); return; } await currentUser.sendEmailVerification(); show('Firebase accepted the verification email request. Check your inbox and spam folder.'); } catch (error) { show(verificationError(error)); } finally { verify.disabled = false; } };
   signup.onclick = () => {
     try {
       const firstName = normalizeName(signupFirstName.value, 'First name');
@@ -927,12 +947,13 @@ export default function(component) {
     if (!data?.signup_approved || signupInFlight || !signupEmail.value.trim() || !signupPassword.value || !inviteCode.value.trim() || !signupFirstName.value.trim() || !signupLastName.value.trim()) return;
     signupInFlight = true;
     try {
-      const body = await post('accounts:signUp', {email: signupEmail.value.trim(), password: signupPassword.value, returnSecureToken: true});
-      idToken = body.idToken;
-      storeRefreshToken(body.refreshToken);
-      scheduleRefresh(Number(body.expiresIn || 3600));
+      if (!firebaseAuth) throw new Error('Firebase browser SDK is not ready.');
+      const credential = await firebaseAuth.createUserWithEmailAndPassword(signupEmail.value.trim(), signupPassword.value);
+      currentUser = credential.user;
+      await currentUser.updateProfile({displayName: signupFirstName.value.trim() + ' ' + signupLastName.value.trim()});
       let verificationSent = true;
-      try { await post('accounts:sendOobCode', {requestType: 'VERIFY_EMAIL', idToken}); } catch (error) { verificationSent = false; }
+      try { await currentUser.sendEmailVerification(); } catch (error) { verificationSent = false; }
+      idToken = await currentUser.getIdToken(true);
       setTriggerValue('signup_result', {id_token: idToken, invite_code: inviteCode.value.trim(), first_name: signupFirstName.value.trim(), last_name: signupLastName.value.trim()});
       show(verificationSent ? 'Account created. Check your email, verify it, then use Sign in.' : 'Account created. Ask Firebase to resend the verification email, then use Sign in.');
       signupPassword.value = '';
@@ -940,24 +961,44 @@ export default function(component) {
       show('Account creation failed. Check the invitation, password, and email address.');
     } finally { signupInFlight = false; }
   };
-  logout.onclick = () => { if (refreshTimer) window.clearTimeout(refreshTimer); idToken = null; clearStoredSession(); refreshToken = null; if (!data?.verification_only) { setTriggerValue('logout', true); setStateValue('signed_in', false); } show('Signed out.'); };
+  logout.onclick = async () => { try { if (firebaseAuth) await firebaseAuth.signOut(); } finally { idToken = null; if (!data?.verification_only) { setTriggerValue('logout', true); setStateValue('signed_in', false); } show('Signed out.'); } };
   if (data?.signup_error) show(data.signup_error);
   if (data?.signup_profile) {
     signupFirstName.value = String(data.signup_profile.first_name || signupFirstName.value || '');
     signupLastName.value = String(data.signup_profile.last_name || signupLastName.value || '');
   }
-  if (data?.force_signout) { if (refreshTimer) window.clearTimeout(refreshTimer); idToken = null; clearStoredSession(); refreshToken = null; }
   if (!config.apiKey || !config.authDomain || !config.appId) { window.clearTimeout(loadingRecoveryTimer); showLogin(); show('Firebase sign-in is unavailable until the local Web App configuration is complete.'); return; }
   if (data?.verification_only) { signupTab.hidden = true; signupPanel.hidden = true; showLogin(); }
   if (data?.authenticated) { window.clearTimeout(loadingRecoveryTimer); loading.hidden = true; authTabs.hidden = true; login.hidden = true; reset.hidden = true; verify.hidden = true; email.disabled = true; password.hidden = true; logout.hidden = false; signupTab.hidden = true; signupPanel.hidden = true; }
   else {
     logout.hidden = true;
     if (!data?.verification_only) {
-      if (refreshToken) { loading.hidden = false; authTabs.hidden = true; loginPanel.hidden = true; signupPanel.hidden = true; refresh(); }
-      else { window.clearTimeout(loadingRecoveryTimer); showLogin(); }
-      registerAfterApproval();
+      showRestoring();
     }
   }
+  const initializeFirebaseAuth = async () => {
+    try {
+      const firebase = await loadFirebaseSdk();
+      const appName = 'bako-sweet-auth-' + String(config.projectId || 'default');
+      const existingApp = firebase.apps.find((app) => app.name === appName);
+      const firebaseApp = existingApp || firebase.initializeApp({
+        apiKey: config.apiKey,
+        authDomain: config.authDomain,
+        projectId: config.projectId,
+        appId: config.appId,
+      }, appName);
+      firebaseAuth = firebaseApp.auth();
+      await firebaseAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+      if (data?.force_signout) await firebaseAuth.signOut();
+      firebaseAuth.onIdTokenChanged(handleUser);
+      if (data?.signup_approved) registerAfterApproval();
+    } catch (error) {
+      window.clearTimeout(loadingRecoveryTimer);
+      showLogin();
+      show('Firebase sign-in is unavailable. Check the Web App configuration and network connection.');
+    }
+  };
+  initializeFirebaseAuth();
   return () => {};
 }
 """

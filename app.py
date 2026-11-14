@@ -650,7 +650,8 @@ def _render_workbook_ready_card() -> None:
                 "<div class='cs-upload-feedback cs-upload-feedback--success'>"
                 "<div class='cs-upload-feedback-icon'>✓</div>"
                 "<div class='cs-upload-feedback-copy'>"
-                "<div class='cs-upload-feedback-title'>Workbook is supplying the dashboard</div>"
+                "<div class='cs-upload-feedback-title'>Workbook Loaded Successfully</div>"
+                "<div class='cs-upload-feedback-message'>Inventory data is ready for analysis.</div>"
                 f"<div class='cs-upload-feedback-file'>{html.escape(str(filename))}</div>"
                 "</div></div>",
                 unsafe_allow_html=True,
@@ -1444,6 +1445,13 @@ if FIREBASE_AUTH_CONFIG.enabled:
             "Ask the project administrator to configure the Firebase web app settings."
         )
         st.stop()
+    # Resolve sign-out before reading the cached verified identity. The
+    # sidebar sets this flag while the auth component is not rendered, so the
+    # server session must be cleared before deciding which branch to render.
+    force_signout = bool(st.session_state.pop("firebase_force_signout", False))
+    if force_signout:
+        clear_auth_session(st.session_state)
+
     # Do not render the full auth component once a verified session exists.
     # Removing it from the Streamlit tree prevents the login form from
     # occupying space or reappearing during ordinary reruns/tab navigation.
@@ -1453,17 +1461,22 @@ if FIREBASE_AUTH_CONFIG.enabled:
         signup_approval = st.session_state.get("firebase_signup_approval")
         signup_approval_active = isinstance(signup_approval, dict)
         signup_profile = st.session_state.get("firebase_signup_profile")
-        force_signout = bool(st.session_state.pop("firebase_force_signout", False))
-        auth_panel_slot = st.empty()
-        with auth_panel_slot.container():
-            with st.container(horizontal_alignment="center"):
-                auth_event = render_firebase_auth_component(
-                    FIREBASE_AUTH_CONFIG,
-                    signup_approved=signup_approval_active,
-                    signup_profile=signup_profile if isinstance(signup_profile, dict) else None,
-                    signup_error=str(st.session_state.get("firebase_signup_error", "")),
-                    force_signout=force_signout,
-                )
+        # Render the keyed auth surface directly so the auth-scoped theme can
+        # remove the 1rem gap Streamlit places before the surface's first child.
+        auth_panel_slot = st.container(
+            key="firebase_auth_page",
+            width="stretch",
+            height="content",
+            horizontal_alignment="center",
+        )
+        with auth_panel_slot:
+            auth_event = render_firebase_auth_component(
+                FIREBASE_AUTH_CONFIG,
+                signup_approved=signup_approval_active,
+                signup_profile=signup_profile if isinstance(signup_profile, dict) else None,
+                signup_error=str(st.session_state.get("firebase_signup_error", "")),
+                force_signout=force_signout,
+            )
     signup_request = auth_event.get("signup_request")
     if isinstance(signup_request, dict):
         request_email = str(signup_request.get("email", "")).strip().casefold()
@@ -1546,6 +1559,9 @@ if FIREBASE_AUTH_CONFIG.enabled:
             st.rerun()
     if auth_event.get("logout"):
         clear_auth_session(st.session_state)
+        # Remove the authenticated dashboard tree before the next render.
+        # The following run will show only the full-screen sign-in surface.
+        st.rerun()
     token = auth_event.get("id_token")
     if token:
         auth_started = perf_counter()
@@ -1557,6 +1573,13 @@ if FIREBASE_AUTH_CONFIG.enabled:
                 firebase_employee.role,
                 (perf_counter() - auth_started) * 1000,
             )
+            # The auth component was rendered earlier in this run while the
+            # identity was still unknown. Start a clean rerun now so the
+            # authentication surface is removed before any sidebar or
+            # protected dashboard elements are rendered.
+            if auth_panel_slot is not None:
+                auth_panel_slot.empty()
+            st.rerun()
         except FirebaseAuthError as exc:
             clear_auth_session(st.session_state)
             LOGGER.warning(

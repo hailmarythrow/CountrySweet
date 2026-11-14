@@ -102,12 +102,14 @@ class FirebaseAuthTests(unittest.TestCase):
             require_permission(viewer, "manage_users")
 
     def test_verification_panel_keeps_browser_session_and_safe_errors(self):
-        self.assertIn("const lookup = await post('accounts:lookup', {idToken});", FIREBASE_AUTH_JS)
-        self.assertIn("if (!currentUser || currentUser.emailVerified !== true)", FIREBASE_AUTH_JS)
+        self.assertIn("firebase.auth.Auth.Persistence.LOCAL", FIREBASE_AUTH_JS)
+        self.assertIn("firebaseAuth.onIdTokenChanged(handleUser)", FIREBASE_AUTH_JS)
+        self.assertIn("if (currentUser.emailVerified !== true)", FIREBASE_AUTH_JS)
         self.assertIn("setTriggerValue('id_token', idToken);", FIREBASE_AUTH_JS)
         self.assertIn("Firebase accepted the verification email request.", FIREBASE_AUTH_JS)
         self.assertIn("Firebase rejected the verification request.", FIREBASE_AUTH_JS)
         self.assertIn("Firebase configuration mismatch.", FIREBASE_AUTH_JS)
+        self.assertNotIn("sessionStorage", FIREBASE_AUTH_JS)
 
     def test_session_contains_no_raw_token_and_expires(self):
         employee = employee_from_verified_claims(claims(role="admin"), config=self.config)
