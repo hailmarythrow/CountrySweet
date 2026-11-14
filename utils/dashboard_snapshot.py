@@ -12,16 +12,22 @@ from datetime import date, datetime, timezone
 import gzip
 import hashlib
 import json
+import logging
 import math
 import re
 import uuid
+from time import perf_counter
 from typing import Any, Mapping
 
 import pandas as pd
+import streamlit as st
 from firebase_admin import firestore
 
 from .excel_loader import SheetReport, WorkbookReport, normalize_frame
 from .firebase_admin_client import get_firestore_client
+
+
+LOGGER = logging.getLogger("country_sweet.snapshot")
 
 
 DEFAULT_NAMESPACE = "bako_sweet_dev"
@@ -247,6 +253,7 @@ def publish_dashboard_snapshot(
     frame_write_refs: list[tuple[Any, Mapping[str, Any]]] = []
     total_rows = 0
     total_bytes = 0
+    serialization_started = perf_counter()
     try:
         for frame_name, original_frame in frames.items():
             frame = normalize_frame(original_frame)
@@ -289,7 +296,10 @@ def publish_dashboard_snapshot(
                     "elapsed_ms": float(getattr(report.sheet_reports.get(frame_name), "elapsed_ms", 0.0)),
                 },
             })
+        serialization_ms = (perf_counter() - serialization_started) * 1000
+        chunk_write_started = perf_counter()
         _batch_set(client, frame_write_refs)
+        chunk_write_ms = (perf_counter() - chunk_write_started) * 1000
         metadata = {
             "snapshot_id": snapshot_id,
             "namespace": _safe_namespace(namespace),
@@ -321,7 +331,10 @@ def publish_dashboard_snapshot(
                 "payload_bytes": total_bytes,
             },
         }
+        metadata_write_started = perf_counter()
         snapshot_ref.set(metadata)
+        metadata_write_ms = (perf_counter() - metadata_write_started) * 1000
+        verification_started = perf_counter()
         stored_metadata = snapshot_ref.get().to_dict() or {}
         if stored_metadata.get("status") != "complete" or stored_metadata.get("snapshot_id") != snapshot_id:
             raise DashboardSnapshotError("Snapshot metadata verification failed")
@@ -337,6 +350,7 @@ def publish_dashboard_snapshot(
                 raise DashboardSnapshotError(f"Snapshot chunk verification failed: {chunk_ref.id}")
             if stored_chunk.get("records_checksum") != payload["records_checksum"] or stored_chunk.get("row_count") != payload["row_count"]:
                 raise DashboardSnapshotError(f"Snapshot chunk verification failed: {chunk_ref.id}")
+        verification_ms = (perf_counter() - verification_started) * 1000
         # Reconstruct and validate the complete report before the active
         # pointer can move. A failed restoration therefore cannot invalidate
         # the previously active snapshot.
@@ -358,6 +372,7 @@ def publish_dashboard_snapshot(
             "publisher_uid": source.publisher_uid,
             "publisher_display_name": source.publisher_display_name,
         }
+        pointer_started = perf_counter()
         if expected_active_version is None:
             pointer_ref.set(pointer)
         else:
@@ -374,6 +389,14 @@ def publish_dashboard_snapshot(
                 transaction.set(pointer_ref, pointer)
 
             commit_pointer(transaction)
+        pointer_commit_ms = (perf_counter() - pointer_started) * 1000
+        total_ms = (perf_counter() - serialization_started) * 1000
+        LOGGER.info(
+            "snapshot.publish_complete namespace=%s frames=%d chunks=%d rows=%d serialization_ms=%.1f chunk_write_ms=%.1f metadata_write_ms=%.1f verification_ms=%.1f pointer_commit_ms=%.1f total_ms=%.1f",
+            _safe_namespace(namespace), len(manifests), len(frame_write_refs), total_rows,
+            serialization_ms, chunk_write_ms, metadata_write_ms, verification_ms,
+            pointer_commit_ms, total_ms,
+        )
         return DashboardSnapshot(snapshot_id, _safe_namespace(namespace), source, published_at, restored, metadata["stats"])
     except Exception:
         # Metadata and chunks are disposable if the pointer was not advanced.
@@ -392,11 +415,13 @@ def _restore_snapshot_document(
     *,
     namespace: str,
     stored_chunks: Mapping[str, Mapping[str, Any]] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> WorkbookReport:
     _, chunk_collection, _ = _collections(namespace)
     frames: dict[str, pd.DataFrame] = {}
     manifests = list(metadata.get("manifests", []))
     if stored_chunks is None:
+        chunk_started = perf_counter()
         chunk_refs_by_id = {
             str(chunk_id): client.collection(chunk_collection).document(str(chunk_id))
             for manifest in manifests
@@ -406,6 +431,9 @@ def _restore_snapshot_document(
             snapshot.id: snapshot.to_dict() or {}
             for snapshot in _get_documents(client, list(chunk_refs_by_id.values()))
         }
+        if timings is not None:
+            timings["chunk_fetch_ms"] = (perf_counter() - chunk_started) * 1000
+    deserialize_started = perf_counter()
     for manifest in manifests:
         records: list[dict[str, Any]] = []
         for chunk_id in manifest.get("chunk_ids", []):
@@ -440,6 +468,8 @@ def _restore_snapshot_document(
         )
         for sheet_name, frame in frames.items()
     }
+    if timings is not None:
+        timings["deserialize_ms"] = (perf_counter() - deserialize_started) * 1000
     return WorkbookReport(
         available_sheets=[str(item) for item in metadata.get("available_sheets", [])],
         preferred_sheet=str(metadata.get("preferred_sheet") or ""),
@@ -460,23 +490,59 @@ def restore_dashboard_snapshot(
     namespace: str = DEFAULT_NAMESPACE,
     snapshot_id: str | None = None,
 ) -> DashboardSnapshot | None:
-    """Restore the active complete snapshot, verifying every chunk."""
+    """Restore the active complete snapshot, verifying every chunk.
+
+    The active pointer is always read so a newly published version becomes
+    visible promptly. Once a pointer resolves to an immutable snapshot ID,
+    the metadata/chunk reconstruction is cached by that ID for a short TTL.
+    Authentication and authorization are intentionally performed by the caller
+    before this function; the cache never stores or decides identity claims.
+    """
     client = client or get_firestore_client()
-    snapshot_collection, _, active_collection = _collections(namespace)
+    _, _, active_collection = _collections(namespace)
+    pointer_started = perf_counter()
     if snapshot_id is None:
         pointer = client.collection(active_collection).document("current").get()
         if not pointer.exists:
             return None
         snapshot_id = str((pointer.to_dict() or {}).get("snapshot_id") or "")
+    pointer_ms = (perf_counter() - pointer_started) * 1000
     if not snapshot_id:
         return None
-    metadata = client.collection(snapshot_collection).document(snapshot_id).get()
-    if not metadata.exists:
+    snapshot = _restore_snapshot_cached(str(snapshot_id), _safe_namespace(namespace), client)
+    restore_stats = snapshot.stats if isinstance(snapshot.stats, Mapping) else {}
+    LOGGER.info(
+        "snapshot.restore_complete namespace=%s snapshot_id=%s cache_ttl_seconds=%d pointer_ms=%.1f metadata_ms=%.1f chunk_fetch_ms=%.1f deserialize_ms=%.1f total_ms=%.1f",
+        _safe_namespace(namespace), str(snapshot_id)[:16], 300, pointer_ms,
+        float(restore_stats.get("metadata_read_ms", 0.0)),
+        float(restore_stats.get("chunk_fetch_ms", 0.0)),
+        float(restore_stats.get("deserialize_ms", 0.0)),
+        pointer_ms + float(restore_stats.get("restore_total_ms", 0.0)),
+    )
+    return snapshot
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _restore_snapshot_cached(snapshot_id: str, namespace: str, _client: Any) -> DashboardSnapshot:
+    """Restore one immutable snapshot once per version and process.
+
+    ``_client`` is excluded from Streamlit's cache key so credentials and
+    client internals are never serialized. The snapshot ID and namespace are
+    the key because the snapshot is immutable once published; the caller still
+    checks the active pointer on every invocation.
+    """
+    restore_started = perf_counter()
+    snapshot_collection, _, _ = _collections(namespace)
+    metadata_started = perf_counter()
+    metadata_snapshot = _client.collection(snapshot_collection).document(snapshot_id).get()
+    metadata_ms = (perf_counter() - metadata_started) * 1000
+    if not metadata_snapshot.exists:
         raise DashboardSnapshotError(f"Active snapshot metadata is missing: {snapshot_id}")
-    payload = metadata.to_dict() or {}
+    payload = metadata_snapshot.to_dict() or {}
     if payload.get("status") != "complete":
         raise DashboardSnapshotError(f"Snapshot is not complete: {snapshot_id}")
-    report = _restore_snapshot_document(client, payload, namespace=namespace)
+    restore_timings: dict[str, float] = {}
+    report = _restore_snapshot_document(_client, payload, namespace=namespace, timings=restore_timings)
     source = SnapshotSource(
         workbook_id=str(payload["source_workbook_id"]),
         filename=str(payload["source_filename"]),
@@ -489,7 +555,14 @@ def restore_dashboard_snapshot(
     published_at = payload.get("published_at")
     if not isinstance(published_at, datetime):
         published_at = datetime.now(timezone.utc)
-    return DashboardSnapshot(str(payload["snapshot_id"]), _safe_namespace(namespace), source, published_at, report, payload.get("stats", {}))
+    stats = dict(payload.get("stats", {}) or {})
+    stats.update({
+        "metadata_read_ms": metadata_ms,
+        "chunk_fetch_ms": float(restore_timings.get("chunk_fetch_ms", 0.0)),
+        "deserialize_ms": float(restore_timings.get("deserialize_ms", 0.0)),
+        "restore_total_ms": (perf_counter() - restore_started) * 1000,
+    })
+    return DashboardSnapshot(str(payload["snapshot_id"]), _safe_namespace(namespace), source, published_at, report, stats)
 
 
 def active_snapshot_version(*, client: firestore.Client | None = None, namespace: str = DEFAULT_NAMESPACE) -> str | None:

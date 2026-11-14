@@ -2020,6 +2020,7 @@ if ENABLE_DEV_FIRESTORE_SNAPSHOTS:
 # it to suppress analysis-only controls while Settings is being rendered,
 # without changing the selected worksheet or any calculations.
 settings_page_active = st.session_state.get("sidebar_page", "Executive Overview") == "Settings"
+data_preparation_started = perf_counter()
 
 if workbook_report is None:
     df = demo_data()
@@ -2183,6 +2184,13 @@ else:
 balance = stored - demand if stored is not None and demand is not None else None
 no_matching_records = bool(df is not None and not df.empty and filtered.empty)
 missing_metric_label = "No matching records" if no_matching_records else ("Not available from selected worksheet" if workbook_report else "Unavailable")
+LOGGER.info(
+    "dashboard.data_preparation source=%s rows=%d filtered_rows=%d elapsed_ms=%.1f",
+    active_source or "demo",
+    len(df),
+    len(filtered),
+    (perf_counter() - data_preparation_started) * 1000,
+)
 
 # Resolve the selected page before rendering shared page content so Settings
 # can omit the KPI row during the same Streamlit run as its navigation click.
