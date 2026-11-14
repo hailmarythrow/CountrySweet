@@ -103,12 +103,16 @@ class FirebaseAuthTests(unittest.TestCase):
 
     def test_verification_panel_keeps_browser_session_and_safe_errors(self):
         self.assertIn("firebase.auth.Auth.Persistence.LOCAL", FIREBASE_AUTH_JS)
-        self.assertIn("firebaseAuth.onIdTokenChanged(handleUser)", FIREBASE_AUTH_JS)
+        self.assertIn("firebaseAuth.onIdTokenChanged((user) => runtime.handler", FIREBASE_AUTH_JS)
         self.assertIn("if (currentUser.emailVerified !== true)", FIREBASE_AUTH_JS)
         self.assertIn("setTriggerValue('id_token', idToken);", FIREBASE_AUTH_JS)
         self.assertIn("Firebase accepted the verification email request.", FIREBASE_AUTH_JS)
         self.assertIn("Firebase rejected the verification request.", FIREBASE_AUTH_JS)
         self.assertIn("Firebase configuration mismatch.", FIREBASE_AUTH_JS)
+        self.assertIn("const runtimeKey = '__bakoFirebaseAuthRuntime_'", FIREBASE_AUTH_JS)
+        self.assertIn("if (!runtime.listener) runtime.listener = firebaseAuth.onIdTokenChanged", FIREBASE_AUTH_JS)
+        self.assertIn("Firebase token acquisition timed out.", FIREBASE_AUTH_JS)
+        self.assertIn("return () => { disposed = true;", FIREBASE_AUTH_JS)
         self.assertNotIn("sessionStorage", FIREBASE_AUTH_JS)
 
     def test_session_contains_no_raw_token_and_expires(self):

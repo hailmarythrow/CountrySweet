@@ -1451,6 +1451,7 @@ if FIREBASE_AUTH_CONFIG.enabled:
     force_signout = bool(st.session_state.pop("firebase_force_signout", False))
     if force_signout:
         clear_auth_session(st.session_state)
+        st.session_state.pop("firebase_auth_error", None)
 
     # Do not render the full auth component once a verified session exists.
     # Removing it from the Streamlit tree prevents the login form from
@@ -1559,15 +1560,18 @@ if FIREBASE_AUTH_CONFIG.enabled:
             st.rerun()
     if auth_event.get("logout"):
         clear_auth_session(st.session_state)
+        st.session_state.pop("firebase_auth_error", None)
         # Remove the authenticated dashboard tree before the next render.
         # The following run will show only the full-screen sign-in surface.
         st.rerun()
     token = auth_event.get("id_token")
     if token:
         auth_started = perf_counter()
+        LOGGER.info("auth.id_token_received stage=server_verification")
         try:
             firebase_employee = verify_id_token(str(token), config=FIREBASE_AUTH_CONFIG)
             remember_employee(st.session_state, firebase_employee)
+            st.session_state.pop("firebase_auth_error", None)
             LOGGER.info(
                 "auth.token_verified role=%s elapsed_ms=%.1f",
                 firebase_employee.role,
@@ -1582,12 +1586,18 @@ if FIREBASE_AUTH_CONFIG.enabled:
             st.rerun()
         except FirebaseAuthError as exc:
             clear_auth_session(st.session_state)
+            st.session_state.firebase_auth_error = str(exc)
             LOGGER.warning(
                 "auth.token_verification_failed category=%s elapsed_ms=%.1f",
                 type(exc).__name__,
                 (perf_counter() - auth_started) * 1000,
             )
-            st.error(str(exc))
+            # The component was displaying its restoring overlay while this
+            # event was processed. Re-render it with a durable, safe error so
+            # a failed verification cannot leave the browser dimmed forever.
+            if auth_panel_slot is not None:
+                auth_panel_slot.empty()
+            st.rerun()
     if firebase_employee is None:
         firebase_employee = session_employee(st.session_state)
     if firebase_employee is None:
