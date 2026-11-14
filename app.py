@@ -1058,10 +1058,12 @@ def render_inventory_mix_legend(frame: pd.DataFrame) -> None:
 
 
 OPEN_METEO_TIMEOUT_SECONDS = 4
-OPEN_METEO_ATTEMPTS = 2
+OPEN_METEO_ATTEMPTS = 1
 OPEN_METEO_CACHE_SECONDS = 900
 WEATHER_STALE_SECONDS = 21600
 WEATHER_FAILURE_COOLDOWN_SECONDS = 60
+NOAA_TIMEOUT_SECONDS = 6
+NOAA_USER_AGENT = os.getenv("BAKO_WEATHER_USER_AGENT", "BakoSweetDashboard/1.0")
 
 
 def _open_meteo_get(endpoint: str, *, params: dict[str, object], operation: str) -> requests.Response:
@@ -1094,6 +1096,37 @@ def _open_meteo_get(endpoint: str, *, params: dict[str, object], operation: str)
             session.close()
     assert last_error is not None
     raise last_error
+
+
+def _noaa_get(endpoint: str, *, operation: str) -> requests.Response:
+    """Read NOAA/NWS data without inheriting stale local proxy settings."""
+    started = perf_counter()
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        response = session.get(
+            endpoint,
+            headers={"Accept": "application/geo+json", "User-Agent": NOAA_USER_AGENT},
+            timeout=NOAA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        LOGGER.info(
+            "weather.%s succeeded provider=noaa status=%s elapsed_ms=%.1f",
+            operation,
+            response.status_code,
+            (perf_counter() - started) * 1000,
+        )
+        return response
+    except requests.RequestException as exc:
+        LOGGER.warning(
+            "weather.%s failed provider=noaa elapsed_ms=%.1f error_category=%s",
+            operation,
+            (perf_counter() - started) * 1000,
+            type(exc).__name__,
+        )
+        raise
+    finally:
+        session.close()
 
 
 @st.cache_data(ttl=OPEN_METEO_CACHE_SECONDS, show_spinner=False)
@@ -1190,6 +1223,26 @@ def weather_icon_svg(weather_code: int | None, is_day: bool = True, *, size: int
     )
 
 
+def _weather_code_from_text(condition: str) -> int | None:
+    """Map NOAA's textual condition to the closest existing icon category."""
+    normalized = condition.casefold()
+    if "thunder" in normalized:
+        return 95
+    if any(token in normalized for token in ("snow", "sleet", "ice")):
+        return 71
+    if any(token in normalized for token in ("rain", "shower", "drizzle")):
+        return 61
+    if any(token in normalized for token in ("fog", "haze", "smoke")):
+        return 45
+    if "partly" in normalized:
+        return 2
+    if any(token in normalized for token in ("cloud", "overcast")):
+        return 3
+    if any(token in normalized for token in ("sunny", "clear")):
+        return 0
+    return None
+
+
 @st.cache_data(ttl=OPEN_METEO_CACHE_SECONDS, show_spinner=False)
 def _get_weather_cached(latitude: float, longitude: float, temperature_unit: str = "fahrenheit") -> dict:
     temperature_unit = "celsius" if temperature_unit == "celsius" else "fahrenheit"
@@ -1225,7 +1278,71 @@ def _get_weather_cached(latitude: float, longitude: float, temperature_unit: str
         "icon": icon,
         "weather_code": weather_code,
         "is_day": is_day,
+        "observed_at": str(current.get("time") or ""),
+        "source": "Open-Meteo",
     }
+
+
+@st.cache_data(ttl=OPEN_METEO_CACHE_SECONDS, show_spinner=False)
+def _get_noaa_weather_cached(latitude: float, longitude: float, temperature_unit: str = "fahrenheit") -> dict:
+    """Fetch current conditions from NOAA/NWS when Open-Meteo is unavailable."""
+    temperature_unit = "celsius" if temperature_unit == "celsius" else "fahrenheit"
+    points = _noaa_get(
+        f"https://api.weather.gov/points/{float(latitude):.4f},{float(longitude):.4f}",
+        operation="noaa_points",
+    ).json()
+    properties = points.get("properties") if isinstance(points, dict) else None
+    forecast_url = properties.get("forecastHourly") if isinstance(properties, dict) else None
+    if not forecast_url:
+        raise ValueError("NOAA points response omitted forecastHourly.")
+    forecast = _noaa_get(str(forecast_url), operation="noaa_forecast").json()
+    forecast_properties = forecast.get("properties") if isinstance(forecast, dict) else None
+    periods = forecast_properties.get("periods") if isinstance(forecast_properties, dict) else None
+    if not isinstance(periods, list) or not periods or not isinstance(periods[0], dict):
+        raise ValueError("NOAA forecast response omitted hourly periods.")
+    current = periods[0]
+    try:
+        temperature = float(current["temperature"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("NOAA forecast omitted temperature.") from exc
+    source_unit = str(current.get("temperatureUnit") or "F").upper()
+    if temperature_unit == "celsius" and source_unit == "F":
+        temperature = (temperature - 32.0) * 5.0 / 9.0
+    elif temperature_unit == "fahrenheit" and source_unit == "C":
+        temperature = temperature * 9.0 / 5.0 + 32.0
+    condition = str(current.get("shortForecast") or "Current conditions")
+    return {
+        "temperature": temperature,
+        "temperature_unit": temperature_unit,
+        "condition": condition,
+        "icon": "",
+        "weather_code": _weather_code_from_text(condition),
+        "is_day": bool(current.get("isDaytime", True)),
+        "observed_at": str(current.get("startTime") or ""),
+        "source": "NOAA/NWS",
+    }
+
+
+def _weather_in_unit(recent: dict, temperature_unit: str, *, age: float) -> dict | None:
+    weather = recent.get("weather")
+    if not isinstance(weather, dict):
+        return None
+    cached = dict(weather)
+    source_unit = cached.get("temperature_unit", "fahrenheit")
+    if source_unit != temperature_unit:
+        try:
+            source_temperature = float(cached["temperature"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        cached["temperature"] = (
+            (source_temperature - 32.0) * 5.0 / 9.0
+            if temperature_unit == "celsius"
+            else source_temperature * 9.0 / 5.0 + 32.0
+        )
+        cached["temperature_unit"] = temperature_unit
+    cached["is_cached"] = True
+    cached["cache_age_seconds"] = age
+    return cached
 
 
 def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahrenheit") -> dict:
@@ -1234,25 +1351,21 @@ def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahr
     cache_key = (round(float(latitude), 4), round(float(longitude), 4))
     recent = st.session_state.get("weather_last_success", {}).get(cache_key)
     failure = st.session_state.get("weather_last_failure", {}).get(cache_key)
+    if isinstance(recent, dict):
+        age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
+        if age <= OPEN_METEO_CACHE_SECONDS:
+            cached = _weather_in_unit(recent, temperature_unit, age=age)
+            if cached is not None:
+                return cached
     if isinstance(failure, dict):
         failure_age = max(0.0, epoch_time() - float(failure.get("failed_at", 0.0)))
         if failure_age < WEATHER_FAILURE_COOLDOWN_SECONDS:
             if isinstance(recent, dict):
                 age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
-                if age <= WEATHER_STALE_SECONDS and isinstance(recent.get("weather"), dict):
-                    stale = dict(recent["weather"])
-                    source_unit = stale.get("temperature_unit", "fahrenheit")
-                    if source_unit != temperature_unit:
-                        source_temperature = float(stale["temperature"])
-                        stale["temperature"] = (
-                            (source_temperature - 32.0) * 5.0 / 9.0
-                            if temperature_unit == "celsius"
-                            else source_temperature * 9.0 / 5.0 + 32.0
-                        )
-                        stale["temperature_unit"] = temperature_unit
-                    stale["is_cached"] = True
-                    stale["cache_age_seconds"] = age
-                    return stale
+                if age <= WEATHER_STALE_SECONDS:
+                    stale = _weather_in_unit(recent, temperature_unit, age=age)
+                    if stale is not None:
+                        return stale
             raise requests.RequestException("Weather provider is in a temporary retry cooldown.")
     try:
         weather = dict(_get_weather_cached(float(latitude), float(longitude), temperature_unit))
@@ -1263,33 +1376,48 @@ def get_weather(latitude: float, longitude: float, temperature_unit: str = "fahr
         }
         st.session_state.setdefault("weather_last_failure", {}).pop(cache_key, None)
         return weather
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        st.session_state.setdefault("weather_last_failure", {})[cache_key] = {
-            "failed_at": epoch_time(),
-            "error_type": type(exc).__name__,
-        }
-        LOGGER.warning("weather.forecast_parse_failed latitude=%s longitude=%s error=%s", latitude, longitude, exc)
+    except (requests.RequestException, ValueError, TypeError) as primary_exc:
+        LOGGER.warning(
+            "weather.primary_unavailable provider=Open-Meteo error_category=%s; trying NOAA fallback",
+            type(primary_exc).__name__,
+        )
+        try:
+            weather = dict(_get_noaa_weather_cached(float(latitude), float(longitude), temperature_unit))
+            weather["is_cached"] = False
+            st.session_state.setdefault("weather_last_success", {})[cache_key] = {
+                "weather": dict(weather),
+                "saved_at": epoch_time(),
+            }
+            st.session_state.setdefault("weather_last_failure", {}).pop(cache_key, None)
+            return weather
+        except (requests.RequestException, ValueError, TypeError) as fallback_exc:
+            st.session_state.setdefault("weather_last_failure", {})[cache_key] = {
+                "failed_at": epoch_time(),
+                "error_type": f"{type(primary_exc).__name__}/{type(fallback_exc).__name__}",
+            }
+            LOGGER.warning(
+                "weather.all_providers_failed primary_category=%s fallback_category=%s",
+                type(primary_exc).__name__,
+                type(fallback_exc).__name__,
+            )
+        LOGGER.warning(
+            "weather.forecast_parse_failed latitude=%s longitude=%s error_category=%s",
+            latitude,
+            longitude,
+            type(primary_exc).__name__,
+        )
         if isinstance(recent, dict):
             age = max(0.0, epoch_time() - float(recent.get("saved_at", 0.0)))
-            if age <= WEATHER_STALE_SECONDS and isinstance(recent.get("weather"), dict):
-                stale = dict(recent["weather"])
-                source_unit = stale.get("temperature_unit", "fahrenheit")
-                if source_unit != temperature_unit:
-                    source_temperature = float(stale["temperature"])
-                    stale["temperature"] = (
-                        (source_temperature - 32.0) * 5.0 / 9.0
-                        if temperature_unit == "celsius"
-                        else source_temperature * 9.0 / 5.0 + 32.0
-                    )
-                    stale["temperature_unit"] = temperature_unit
-                stale["is_cached"] = True
-                stale["cache_age_seconds"] = age
+            if age <= WEATHER_STALE_SECONDS:
+                stale = _weather_in_unit(recent, temperature_unit, age=age)
+                if stale is None:
+                    raise primary_exc
                 LOGGER.info(
                     "weather.forecast_using_cached latitude=%s longitude=%s age_seconds=%.0f",
                     latitude, longitude, age,
                 )
                 return stale
-        raise
+        raise primary_exc
 
 
 def apply_weather_location(location: dict) -> None:
@@ -1380,6 +1508,9 @@ def render_top_header() -> tuple[object | None, object]:
                     condition_label = html.escape(str(weather["condition"]))
                     if weather.get("is_cached"):
                         condition_label = f"Cached · {condition_label}"
+                        updated_label = _timestamp_label(weather.get("observed_at"))
+                        if updated_label != "Not available":
+                            condition_label += f" · Updated {updated_label}"
                     weather_markup = (
                         "<div class='cs-weather-widget'>"
                         f"<div class='cs-weather-icon'>{weather_icon_svg(weather.get('weather_code'), weather.get('is_day', True))}</div>"
